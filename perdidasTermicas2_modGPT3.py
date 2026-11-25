@@ -968,29 +968,25 @@ def update_dry_air_mass(state, pressure):
 def simulate_room_substep(room, state, config, weather,
                           psych, hour, dt_s):
     """
-    Integra un subpaso térmico e higrométrico de una estancia.
+    Evoluciona el estado térmico e higrométrico de una estancia
+    durante un subpaso temporal.
 
-    Modelo de parámetros concentrados:
-      - Una temperatura media y una humedad específica media.
-      - Intercambio de masa y entalpía con el exterior.
-      - Transmisión térmica a través de la envolvente.
-      - Ganancias internas, solares y por ocupación.
-      - Deshumidificación y calefacción.
-      - Generación de humedad por ocupación y combustión.
-      - Condensación del exceso de humedad sobre saturación.
+    Los equipos funcionan con potencia fija cuando están activos.
+    La duración efectiva de funcionamiento se calcula dentro del
+    subpaso, sin modular la potencia nominal.
 
-    La ventilación se representa mediante un intercambio equilibrado
-    de aire: la masa de aire seco que entra es igual a la que sale.
-    Esta hipótesis mantiene constante la masa seca del recinto durante
-    el intercambio y evita tener que modelar variaciones de presión.
+    La humedad objetivo se determina a partir de la temperatura
+    y humedad relativa de consigna, manteniendo constante la
+    humedad específica objetivo durante toda la simulación.
 
-    La capacidad térmica efectiva incluye el aire y la masa térmica
-    equivalente de la estancia.
+    La ventilación intercambia masa de aire y energía sensible.
+    No se utiliza la entalpía completa para convertir el contenido
+    latente de vapor en variaciones de temperatura.
     """
 
-    # ---------------------------------------------------------------
-    # 1. CONDICIONES INICIALES Y PROPIEDADES DEL AIRE
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. CONDICIONES INICIALES Y PARÁMETROS GENERALES
+    # ------------------------------------------------------------------
 
     pressure = float(config["pressure_pa"])
 
@@ -1001,223 +997,391 @@ def simulate_room_substep(room, state, config, weather,
     rhout = float(weather["rh"])
     solar = max(0.0, float(weather["solar"]))
 
-    wout = psych.humidity_ratio(tout, rhout, pressure)
+    wout = psych.humidity_ratio(
+        tout,
+        rhout,
+        pressure
+    )
 
     volume = float(state["volume"])
     dry_mass = max(0.01, float(state["dry_air_kg"]))
 
-    dt_s = max(0.0, float(dt_s))
-    dt_h = dt_s / 3600.0
+    dt_s = float(dt_s)
 
     if dt_s <= 0.0:
-        raise ValueError("El intervalo de integración debe ser positivo.")
+        raise ValueError(
+            "El intervalo de integración debe ser positivo."
+        )
 
-    capacity = max(1.0, float(state["capacity"]))
+    dt_h = dt_s / 3600.0
 
-    # ---------------------------------------------------------------
-    # 2. PARÁMETROS DE EQUIPOS Y GANANCIAS
-    # ---------------------------------------------------------------
+    capacity = max(
+        1.0,
+        float(state["capacity"])
+    )
 
+    # Consignas de referencia.
+    target_temperature = float(
+        config["target_temperature"]
+    )
+
+    target_rh = float(
+        config["target_rh"]
+    )
+
+    # Humedad específica correspondiente a las dos consignas.
+    # No depende de la temperatura instantánea de la estancia.
+    target_w = psych.humidity_ratio(
+        target_temperature,
+        target_rh,
+        pressure
+    )
+
+    # ------------------------------------------------------------------
+    # 2. PARÁMETROS DE LOS EQUIPOS DE LA ESTANCIA
+    # ------------------------------------------------------------------
+
+    # La ausencia de un indicador de disponibilidad significa
+    # que el equipo NO está instalado en esta estancia.
+    heater_enabled = bool(
+        resolve_room_param(
+            room,
+            config,
+            "heater_enabled",
+            False
+        )
+    )
+
+    dehumidifier_enabled = bool(
+        resolve_room_param(
+            room,
+            config,
+            "dehumidifier_enabled",
+            False
+        )
+    )
+
+    # Potencia térmica nominal de calefacción.
+    # Representa el escalón de funcionamiento elegido en la configuración.
     heater_kw = max(
         0.0,
-        float(resolve_room_param(
-            room, config, "heater_kw", 0.0
-        ))
+        float(
+            resolve_room_param(
+                room,
+                config,
+                "heater_kw",
+                0.0
+            )
+        )
     )
 
     heating_type = resolve_room_param(
-        room, config, "heating_type", "butane"
+        room,
+        config,
+        "heating_type",
+        "butane"
     )
 
-    heater_enabled = bool(resolve_room_param(
-        room, config, "heater_enabled", True
-    ))
-
-    dehumidifier_enabled = bool(resolve_room_param(
-        room, config, "dehumidifier_enabled", True
-    ))
-
+    # Capacidad nominal del deshumidificador.
     dehumidifier_l_day = max(
         0.0,
-        float(resolve_room_param(
-            room, config, "dehumidifier_l_day", 0.0
-        ))
+        float(
+            resolve_room_param(
+                room,
+                config,
+                "dehumidifier_l_day",
+                0.0
+            )
+        )
     )
 
+    # Potencia eléctrica nominal del deshumidificador.
     dehumidifier_power_kw = max(
         0.0,
-        float(resolve_room_param(
-            room, config, "dehumidifier_power_kw", 0.0
-        ))
+        float(
+            resolve_room_param(
+                room,
+                config,
+                "dehumidifier_power_kw",
+                0.0
+            )
+        )
     )
 
-    # La estancia prevalece sobre el valor global.
+    # Fracción de la potencia eléctrica que se contabiliza como
+    # ganancia térmica sensible en el recinto.
+    # Se conserva el valor de configuración, que puede ser global
+    # o específico de la estancia.
+    dehumidifier_heat_factor = clamp(
+        float(
+            resolve_room_param(
+                room,
+                config,
+                "dehumidifier_heat_factor",
+                1.0
+            )
+        ),
+        0.0,
+        1.0
+    )
+
+    cop = max(
+        1.0,
+        float(config.get("heat_pump_cop", 3.0))
+    )
+
+    # Ganancia sensible interna adicional.
     internal_gain_w = max(
         0.0,
-        float(resolve_room_param(
-            room, config, "internal_gain_w", 0.0
-        ))
+        float(
+            resolve_room_param(
+                room,
+                config,
+                "internal_gain_w",
+                0.0
+            )
+        )
     )
 
-    cop = float(config.get("heat_pump_cop", 3.0))
+    # ------------------------------------------------------------------
+    # 3. VENTILACIÓN EXTERIOR
+    # ------------------------------------------------------------------
 
-    # ---------------------------------------------------------------
-    # 3. VENTILACIÓN EXTERIOR: BALANCE DE MASA Y ENTALPÍA
-    # ---------------------------------------------------------------
-
+    # Renovaciones permanentes de la estancia.
+    # Representan infiltración/ventilación base, no un equipo activable.
     ach_base = max(
         0.0,
         float(room.get("air_changes_h", 0.0))
     )
 
-    # El caudal de ventana ya se calcula en simulate() antes de
-    # intercambiar aire entre estancias. Se conserva ese valor para
-    # que ambos cálculos utilicen exactamente el mismo caudal.
+    # Caudal máximo disponible por las ventanas configuradas.
+    # window_airflow ya tiene en cuenta:
+    #   - windows_open
+    #   - window_opening_area_m2
+    #   - window_airflow_m3_h, si se ha especificado
+    #   - velocidad del viento
     if "_window_airflow" in state:
         q_window = max(
             0.0,
             float(state["_window_airflow"])
         )
     else:
-        q_window = window_airflow(room, weather)
+        q_window = window_airflow(
+            room,
+            weather
+        )
+
         state["_window_airflow"] = q_window
 
-    ach_window = q_window / max(0.1, volume)
-
-    target_w_vent = psych.humidity_ratio(
-        t,
-        float(config["target_rh"]),
-        pressure
+    # Caudal disponible expresado como renovaciones/hora.
+    ach_window_available = (
+        q_window / max(0.1, volume)
     )
 
-    ach_control = ventilation_control_ach(
-        w,
-        wout,
-        target_w_vent,
-        ach_base + ach_window,
-        float(config.get("ventilation_max_ach", 2.0)),
-        bool(config.get("ventilation_control", True))
+    # El ACH máximo es un límite para la renovación total.
+    # La ventilación adicional nunca puede superar el caudal
+    # físicamente disponible por las ventanas configuradas.
+    ventilation_max_ach = max(
+        0.0,
+        float(config.get("ventilation_max_ach", 2.0))
     )
 
-    ach_total = ach_base + ach_window + ach_control
+    ach_window_limit = min(
+        ach_window_available,
+        max(0.0, ventilation_max_ach - ach_base)
+    )
+
+    ventilation_control = bool(
+        config.get("ventilation_control", True)
+    )
+
+    if ventilation_control:
+
+        # Ventilación automática:
+        # se activa únicamente cuando la humedad específica interior
+        # supera la consigna y el aire exterior es más seco.
+        #
+        # El caudal adicional máximo queda limitado por las ventanas.
+        ach_window_used = ventilation_control_ach(
+            w,
+            wout,
+            target_w,
+            ach_base,
+            ach_base + ach_window_limit,
+            True
+        )
+
+    else:
+
+        # Sin control automático, las ventanas configuradas como
+        # abiertas producen el intercambio correspondiente
+        # durante todo el subpaso.
+        ach_window_used = ach_window_limit
+
+    # Renovación total efectiva solicitada.
+    ach_total = ach_base + ach_window_used
 
     ventilation_w = 0.0
 
     if ach_total > 0.0:
 
-        # Volumen de aire intercambiado durante el subpaso.
-        exchanged_volume = ach_total * volume * dt_h
-
-        # Masa de aire seco equivalente del aire interior y exterior.
-        # Se utiliza la media para representar un intercambio
-        # equilibrado con igual masa entrante y saliente.
-        mass_inside = dry_air_mass(
-            exchanged_volume,
-            t,
-            w,
-            pressure
+        # Fracción de aire sustituida durante el subpaso.
+        # Se obtiene de la solución exponencial para ACH constante.
+        exchange_fraction = (
+            1.0 - math.exp(-ach_total * dt_h)
         )
 
-        mass_outside = dry_air_mass(
-            exchanged_volume,
-            tout,
-            wout,
-            pressure
+        # Límite de estabilidad para intercambios muy elevados.
+        # Se aplica también al balance de humedad, para mantener
+        # la coherencia entre la masa y la energía intercambiadas.
+        exchange_fraction = min(
+            0.45,
+            max(0.0, exchange_fraction)
         )
 
+        decay = 1.0 - exchange_fraction
+
+        # Masa seca intercambiada durante el subpaso.
         exchanged_dry_mass = (
-            mass_inside + mass_outside
-        ) / 2.0
-
-        # Límite de estabilidad: no intercambiar más del 45 %
-        # de la masa seca del recinto en un único subpaso.
-        exchanged_dry_mass = min(
-            exchanged_dry_mass,
-            0.45 * dry_mass
+            dry_mass * exchange_fraction
         )
 
-        # Entalpías específicas del aire húmedo, kJ/kg aire seco.
-        h_inside = psych.enthalpy_kj_kg(t, w)
-        h_outside = psych.enthalpy_kj_kg(tout, wout)
-
-        # Balance de humedad:
-        # masa de vapor entrante menos masa de vapor saliente.
-        moisture_delta = (
-            exchanged_dry_mass * (wout - w)
+        # Balance exponencial de humedad.
+        w = (
+            wout +
+            (w - wout) * decay
         )
 
-        w += moisture_delta / dry_mass
         w = max(0.0, w)
 
-        # Balance energético:
-        # energía entrante menos energía saliente.
-        #
-        # kJ/kg * kg = kJ.
-        # Se convierte a W dividiendo por el tiempo en segundos.
-        ventilation_energy_j = (
-            exchanged_dry_mass *
-            (h_outside - h_inside) *
-            1000.0
+        # Capacidad calorífica específica sensible del aire húmedo.
+        # Se utiliza un valor medio entre el aire interior y exterior.
+        # No se incluye el término de calor latente de vaporización.
+        cp_inside = CP_AIR + 1860.0 * max(
+            0.0,
+            float(state["w"])
         )
 
-        ventilation_w = ventilation_energy_j / dt_s
+        cp_outside = CP_AIR + 1860.0 * wout
 
-        # Volumen equivalente contabilizado como ventilación.
+        cp_exchange = (
+            cp_inside + cp_outside
+        ) / 2.0
+
+        # Transporte de energía sensible.
+        ventilation_energy_j = (
+            exchanged_dry_mass
+            * cp_exchange
+            * (tout - t)
+        )
+
+        # Potencia térmica media equivalente del intercambio.
+        ventilation_w = (
+            ventilation_energy_j / dt_s
+        )
+
+        # Si se ha aplicado el límite de estabilidad, el caudal
+        # contabilizado debe corresponder a la fracción realmente
+        # intercambiada.
+        ach_total = (
+            -math.log(decay) / dt_h
+        )
+
         state["ventilation_m3"] += (
             ach_total * volume * dt_h
         )
 
-    # Los minutos reflejan la ventilación adicional por ventanas
-    # o por control higrométrico, no la infiltración base permanente.
-    if ach_control > 0.0 or ach_window > 0.0:
-        state["ventilation_minutes"] += dt_h * 60.0
+    # El contador de minutos refleja la ventilación adicional
+    # por ventanas, no las renovaciones base permanentes.
+    if ach_window_used > 0.0:
+        state["ventilation_minutes"] += (
+            dt_h * 60.0
+        )
 
-    # ---------------------------------------------------------------
-    # 4. OCUPACIÓN Y GANANCIAS INTERNAS
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 4. OCUPACIÓN Y GENERACIÓN INTERNA DE HUMEDAD
+    # ------------------------------------------------------------------
 
-    people = room_occupancy(room, config, hour)
+    people = room_occupancy(
+        room,
+        config,
+        hour
+    )
 
+    moisture_per_person = max(
+        0.0,
+        float(
+            config.get("moisture_per_person_g_h", 0.0)
+        )
+    )
+
+    sensible_gain_per_person = max(
+        0.0,
+        float(
+            config.get("sensible_gain_per_person_w", 0.0)
+        )
+    )
+
+    # Generación de vapor de agua por ocupación.
     moisture_kg = (
-        people *
-        float(config["moisture_per_person_g_h"]) /
-        1000.0 *
-        dt_h
+        people
+        * moisture_per_person
+        / 1000.0
+        * dt_h
     )
 
-    sensible_w = (
-        people *
-        float(config["sensible_gain_per_person_w"]) +
-        internal_gain_w
-    )
-
-    # La humedad generada por las personas se incorpora al balance
-    # de masa de vapor del recinto.
     w += moisture_kg / dry_mass
 
-    # Ganancia solar simplificada a través de las ventanas.
+    # Ganancias sensibles por ocupación y otros equipos internos.
+    sensible_w = (
+        people * sensible_gain_per_person
+        + internal_gain_w
+    )
+
+    # ------------------------------------------------------------------
+    # 5. GANANCIA SOLAR
+    # ------------------------------------------------------------------
+
     solar_w = 0.0
 
     if config.get("solar_enabled", True):
-        solar_w = (
-            solar *
-            float(room.get("window_area", 0.0)) *
+
+        solar_factor = max(
+            0.0,
             float(config.get("solar_factor", 0.55))
         )
 
-    # ---------------------------------------------------------------
-    # 5. DESHUMIDIFICACIÓN
-    # ---------------------------------------------------------------
+        window_area = max(
+            0.0,
+            float(room.get("window_area", 0.0))
+        )
+
+        solar_w = (
+            solar
+            * window_area
+            * solar_factor
+        )
+
+    # ------------------------------------------------------------------
+    # 6. DESHUMIDIFICACIÓN
+    # ------------------------------------------------------------------
 
     extracted_kg = 0.0
     dehum_minutes = 0.0
     dehum_heat_w = 0.0
     dehum_electric_kwh = 0.0
 
-    if dehumidifier_enabled and dehumidifier_l_day > 0.0:
+    if (
+        dehumidifier_enabled
+        and dehumidifier_l_day > 0.0
+    ):
 
+        # HR instantánea: se utiliza para estimar la capacidad
+        # real de extracción del aparato.
         rh = psych.relative_humidity(
-            t, w, pressure
+            t,
+            w,
+            pressure
         )
 
         cap_kg_h = dehumidifier_capacity_kg_h(
@@ -1226,80 +1390,86 @@ def simulate_room_substep(room, state, config, weather,
             rh
         )
 
-        target_w = psych.humidity_ratio(
-            t,
-            float(config["target_rh"]),
-            pressure
-        )
-
+        # Cantidad de agua que debe extraerse para alcanzar
+        # la humedad específica correspondiente a las consignas.
         excess_kg = max(
             0.0,
             (w - target_w) * dry_mass
         )
 
-        extracted_kg = min(
-            excess_kg,
-            cap_kg_h * dt_h
-        )
+        if (
+            excess_kg > 0.0
+            and cap_kg_h > 0.0
+        ):
 
-        if extracted_kg > 0.0:
+            # El equipo trabaja a su capacidad nominal efectiva
+            # mientras exista humedad por encima del objetivo.
+            extracted_kg = min(
+                excess_kg,
+                cap_kg_h * dt_h
+            )
 
             w -= extracted_kg / dry_mass
             w = max(0.0, w)
 
+            # Tiempo real de funcionamiento dentro del subpaso.
+            # Se desconecta cuando alcanza la consigna.
+            dehum_minutes = min(
+                dt_h * 60.0,
+                extracted_kg / cap_kg_h * 60.0
+            )
+
             state["dehumidified_kg"] += extracted_kg
 
-            dehum_minutes = (
-                extracted_kg / cap_kg_h * 60.0
-                if cap_kg_h > 0.0 else 0.0
+            state["dehumidifier_minutes"] += (
+                dehum_minutes
             )
 
-            state["dehumidifier_minutes"] += dehum_minutes
-
-            # Energía eléctrica consumida durante el funcionamiento.
+            # Energía eléctrica realmente consumida.
             dehum_electric_kwh = (
-                dehumidifier_power_kw *
-                dehum_minutes / 60.0
+                dehumidifier_power_kw
+                * dehum_minutes / 60.0
             )
 
-            state["dehumidifier_kwh"] += dehum_electric_kwh
-
-            # El evaporador absorbe calor del aire y el condensador
-            # lo devuelve al mismo recinto. El efecto térmico neto
-            # del equipo es, aproximadamente, su potencia eléctrica.
-            #
-            # heat_factor permite representar pérdidas o una fracción
-            # de calor que no retorna al recinto.
-            heat_factor = float(
-                config.get("dehumidifier_heat_factor", 1.0)
+            state["dehumidifier_kwh"] += (
+                dehum_electric_kwh
             )
 
-            dehum_heat_w = (
-                dehumidifier_power_kw *
-                1000.0 *
-                heat_factor *
-                (dehum_minutes / (dt_h * 60.0))
+            # Ganancia térmica sensible.
+            # No se suma el calor latente de condensación:
+            # ya está incluido en el ciclo frigorífico del aparato.
+            duty_fraction = (
+                dehum_minutes / (dt_h * 60.0)
             )
 
-    # ---------------------------------------------------------------
-    # 6. TRANSMISIÓN TÉRMICA Y BALANCE ENERGÉTICO
-    # ---------------------------------------------------------------
+            # Ganancia sensible asociada al consumo eléctrico.
+            electric_heat_w = dehumidifier_power_kw * 1000.0 * dehumidifier_heat_factor * duty_fraction
+            # Calor latente recuperado por la condensación del vapor extraído.
+            # Se distribuye sobre la duración completa del subpaso.
+            latent_heat_w = (extracted_kg * H_FG) / dt_s
+            # Ganancia térmica total del deshumidificador.
+            dehum_heat_w = electric_heat_w + latent_heat_w
 
-    # UA contiene exclusivamente la transmisión por la envolvente.
-    # La ventilación ya está incorporada mediante ventilation_w.
+    # ------------------------------------------------------------------
+    # 7. BALANCE TÉRMICO SIN CALEFACCIÓN
+    # ------------------------------------------------------------------
+
+    # UA únicamente de la envolvente.
+    # Las pérdidas por ventilación ya están contabilizadas
+    # mediante ventilation_w.
     ua = max(
         0.0,
         float(state["ua_envelope"])
     )
 
     gains_without_heating = (
-        sensible_w +
-        solar_w +
-        dehum_heat_w +
-        ventilation_w
+        sensible_w
+        + solar_w
+        + dehum_heat_w
+        + ventilation_w
     )
 
-    # Evolución térmica sin calefacción.
+    # Temperatura final si la calefacción permaneciera apagada.
     t_free = exact_thermal_step(
         t,
         tout,
@@ -1309,95 +1479,163 @@ def simulate_room_substep(room, state, config, weather,
         dt_s
     )
 
-    # ---------------------------------------------------------------
-    # 7. CALEFACCIÓN
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 8. CALEFACCIÓN: FUNCIONAMIENTO BINARIO A POTENCIA FIJA
+    # ------------------------------------------------------------------
 
-    heater_w = 0.0
-
-    target_temperature = float(
-        config["target_temperature"]
+    heater_power_w = (
+        heater_kw * 1000.0
     )
+
+    heater_on_seconds = 0.0
+
+    def temperature_after_heater(on_seconds):
+        """
+        Calcula la temperatura final del subpaso suponiendo que
+        la calefacción funciona a potencia fija durante on_seconds
+        y permanece apagada durante el resto.
+
+        No existe modulación de potencia: el equipo está encendido
+        a potencia nominal o apagado.
+        """
+
+        on_seconds = clamp(
+            float(on_seconds),
+            0.0,
+            dt_s
+        )
+
+        off_seconds = dt_s - on_seconds
+
+        temperature = t
+
+        # Primera fase: calefacción encendida.
+        if on_seconds > 1e-9:
+
+            temperature = exact_thermal_step(
+                temperature,
+                tout,
+                ua,
+                capacity,
+                gains_without_heating + heater_power_w,
+                on_seconds
+            )
+
+        # Segunda fase: calefacción apagada.
+        if off_seconds > 1e-9:
+
+            temperature = exact_thermal_step(
+                temperature,
+                tout,
+                ua,
+                capacity,
+                gains_without_heating,
+                off_seconds
+            )
+
+        return temperature
 
     if (
-        heater_enabled and
-        heater_kw > 0.0 and
-        t_free < target_temperature
+        heater_enabled
+        and heater_power_w > 0.0
+        and t < target_temperature
+        and t_free < target_temperature
     ):
 
-        # Respuesta térmica a una potencia constante durante
-        # el subpaso, considerando la transmisión de la envolvente.
-        if ua > 1e-9:
-            decay = math.exp(
-                -ua * dt_s / capacity
-            )
+        # Temperatura final si la calefacción permaneciese
+        # encendida durante todo el subpaso.
+        t_full = temperature_after_heater(
+            dt_s
+        )
 
-            response = (
-                (1.0 - decay) / ua
-            )
+        if t_full <= target_temperature:
+
+            # La potencia nominal completa durante todo el intervalo
+            # no llega a superar la consigna.
+            heater_on_seconds = dt_s
 
         else:
-            response = dt_s / capacity
 
-        required_w = max(
-            0.0,
-            (target_temperature - t_free) /
-            max(1e-12, response)
-        )
+            # La calefacción a potencia nominal superaría la consigna.
+            # Buscamos el instante de desconexión dentro del subpaso.
+            #
+            # Se utiliza bisección para encontrar el tiempo durante
+            # el que el equipo debe estar encendido a potencia fija.
+            low = 0.0
+            high = dt_s
 
-        heater_w = min(
-            heater_kw * 1000.0,
-            required_w
-        )
+            for _ in range(50):
 
-    # Evolución térmica definitiva.
-    t_new = exact_thermal_step(
-        t,
-        tout,
-        ua,
-        capacity,
-        gains_without_heating + heater_w,
-        dt_s
+                mid = (low + high) / 2.0
+
+                t_mid = temperature_after_heater(
+                    mid
+                )
+
+                if t_mid < target_temperature:
+                    low = mid
+                else:
+                    high = mid
+
+            heater_on_seconds = (
+                low + high
+            ) / 2.0
+
+    # Temperatura final con la duración de funcionamiento calculada.
+    t_new = temperature_after_heater(
+        heater_on_seconds
     )
 
-    # ---------------------------------------------------------------
-    # 8. HUMEDAD GENERADA POR LA COMBUSTIÓN
-    # ---------------------------------------------------------------
+    # Potencia media equivalente durante el subpaso.
+    # La potencia instantánea cuando está encendida sigue siendo
+    # exactamente heater_power_w.
+    heater_w = (
+        heater_power_w
+        * heater_on_seconds / dt_s
+    )
+
+    # ------------------------------------------------------------------
+    # 9. HUMEDAD GENERADA POR LA COMBUSTIÓN
+    # ------------------------------------------------------------------
 
     combustion_g = 0.0
 
-    if heating_type == "butane" and heater_w > 0.0:
+    heater_kwh_th = (
+        heater_power_w
+        * heater_on_seconds
+        / 3600000.0
+    )
 
-        thermal_kwh = (
-            heater_w * dt_s / 3600000.0
-        )
+    if (
+        heating_type == "butane"
+        and heater_kwh_th > 0.0
+    ):
 
-        fuel_kwh = (
-            thermal_kwh /
-            max(0.1, heater_efficiency("butane"))
+        # Energía química consumida como combustible.
+        fuel_kwh = heater_energy_kwh(
+            heater_kwh_th,
+            heating_type,
+            cop
         )
 
         combustion_g = (
-            fuel_kwh *
-            float(config.get(
-                "combustion_moisture_g_kwh", 75.0
-            ))
+            fuel_kwh
+            * float(
+                config.get(
+                    "combustion_moisture_g_kwh",
+                    75.0
+                )
+            )
         )
 
+        # Incorporación del vapor generado por la combustión.
         w += (
             combustion_g / 1000.0
         ) / dry_mass
 
-    # ---------------------------------------------------------------
-    # 9. ACTUALIZACIÓN DE ESTADO Y CONSUMOS
-    # ---------------------------------------------------------------
-
-    state["temperature"] = t_new
-    state["w"] = max(0.0, w)
-
-    heater_kwh_th = (
-        heater_w * dt_s / 3600000.0
-    )
+    # ------------------------------------------------------------------
+    # 10. ENERGÍA CONSUMIDA POR CALEFACCIÓN
+    # ------------------------------------------------------------------
 
     heater_kwh = heater_energy_kwh(
         heater_kwh_th,
@@ -1405,28 +1643,41 @@ def simulate_room_substep(room, state, config, weather,
         cop
     )
 
-    state["heater_kwh_th"] += heater_kwh_th
-    state["heater_kwh"] += heater_kwh
-
-    state["heater_butane_kg"] += heater_butane_kg(
-        heater_kwh_th,
-        heating_type
+    state["heater_kwh_th"] += (
+        heater_kwh_th
     )
 
-    if heater_kw > 0.0 and heater_w > 0.0:
+    state["heater_kwh"] += (
+        heater_kwh
+    )
+
+    state["heater_butane_kg"] += (
+        heater_butane_kg(
+            heater_kwh_th,
+            heating_type
+        )
+    )
+
+    if heater_on_seconds > 0.0:
+
         state["heater_minutes"] += (
-            60.0 *
-            dt_h *
-            heater_w /
-            (heater_kw * 1000.0)
+            heater_on_seconds / 60.0
         )
 
-    # ---------------------------------------------------------------
-    # 10. CONDENSACIÓN Y CALOR LATENTE
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 11. ACTUALIZACIÓN DEL ESTADO Y CONDENSACIÓN
+    # ------------------------------------------------------------------
 
-    update_dry_air_mass(state, pressure)
+    state["temperature"] = t_new
+    state["w"] = max(0.0, w)
 
+    update_dry_air_mass(
+        state,
+        pressure
+    )
+
+    # Condensación si la humedad específica supera la saturación
+    # correspondiente a la temperatura final.
     condensate = apply_condensation(
         state,
         psych,
@@ -1435,31 +1686,41 @@ def simulate_room_substep(room, state, config, weather,
 
     if condensate > 0.0:
 
-        # Se considera que el calor latente liberado por la
-        # condensación retorna al nodo térmico concentrado.
+        # El calor latente liberado por condensación se incorpora
+        # a la capacidad térmica concentrada de la estancia.
         state["temperature"] += (
-            condensate *
-            H_FG /
-            max(1.0, capacity)
+            condensate
+            * H_FG
+            / max(1.0, capacity)
         )
 
-    update_dry_air_mass(state, pressure)
+    update_dry_air_mass(
+        state,
+        pressure
+    )
 
-    # ---------------------------------------------------------------
-    # 11. RESULTADOS DEL SUBPASO
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 12. RESULTADO DEL SUBPASO
+    # ------------------------------------------------------------------
 
     return {
         "people": people,
         "solar_w": solar_w,
         "ua": ua,
         "heater_w": heater_w,
+        "heater_on_w": (
+            heater_power_w if heater_on_seconds > 0.0 else 0.0
+        ),
+        "heater_kw": heater_kw,
+        "heater_on_minutes": heater_on_seconds / 60.0,
         "dehum_heat_w": dehum_heat_w,
+        "dehum_minutes": dehum_minutes,
         "combustion_g": combustion_g,
         "ventilation_ach": ach_total,
+        "ventilation_window_ach": ach_window_used,
         "ventilation_w": ventilation_w,
-        "heater_kw": heater_kw,
-        "heating_type": heating_type,
+        "heater_kwh_th": heater_kwh_th,
+        "heating_type": heating_type
     }
     
 # ---------------------------------------------------------------------------
@@ -1751,10 +2012,6 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
                 hour_data[name]["ua"] += data["ua"]
                 hour_data[name]["solar_w"] += data["solar_w"]
                 hour_data[name]["people"] = data["people"]
-
-        # -----------------------------------------------------------
-        # RESULTADOS AL FINAL DE LA HORA
-        # -----------------------------------------------------------
 
         # -----------------------------------------------------------
         # RESULTADOS AL FINAL DE LA HORA
@@ -2156,16 +2413,16 @@ class App:
 
     def _build_ui(self):
         style = ttk.Style(self.root)
-
+        # CONFIGURACION DE FUENTES Y ALTURA DE FILAS
         style.configure(
             "Treeview",
-            font=("Segoe UI", 8),
-            rowheight=28
+            font=("Segoe UI", 7),
+            rowheight=42
         )
 
         style.configure(
             "Treeview.Heading",
-            font=("Segoe UI", 8, "bold"),
+            font=("Segoe UI", 7, "bold"),
             padding=(4, 6)
         )
 
