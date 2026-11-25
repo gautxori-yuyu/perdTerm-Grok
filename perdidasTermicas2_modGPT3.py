@@ -22,6 +22,9 @@ import os
 import json
 import math
 import copy
+import calendar
+import hashlib
+from datetime import date, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -146,7 +149,18 @@ DEFAULT_CONFIG = {
             "wind_factor": 0.60,
             "window_discharge_coefficient": 0.60
         }
-    ]
+    ],
+    "latitude_deg": 42.5,
+    "longitude_deg": -8.0,
+    "altitude_m": 0.0,
+
+    "solar_date": date.today().isoformat(),
+    "solar_utc_offset_hours": None,
+
+    "solar_glazing_area_factor": 0.90,
+    "solar_ground_reflectance": 0.20,
+    "solar_shading_factor": 1.0
+    "solar_hour_reference": "interval_end",
 }
 
 # CONEXIONES ENTRE ESTANCIAS
@@ -177,6 +191,21 @@ DOOR_DEFAULTS = {
     }
 }
 
+SOLAR_ORIENTATIONS = {
+    "N": 0.0,
+    "NE": 45.0,
+    "E": 90.0,
+    "SE": 135.0,
+    "S": 180.0,
+    "SO": 225.0,
+    "O": 270.0,
+    "NO": 315.0,
+
+    # Alias por compatibilidad.
+    "NW": 315.0,
+    "W": 270.0,
+    "SW": 225.0
+}
 
 # ---------------------------------------------------------------------------
 # PSICROMETRIA
@@ -263,28 +292,79 @@ def room_geometry(room):
 
 
 def room_envelope_ua(room):
-    """Transmitancia térmica global de los cerramientos exteriores, W/K."""
+    """
+    Calcula la conductancia térmica de la envolvente,
+    sin incluir la ventilación, en W/K.
+    """
+
     return (
-        float(room.get("window_area", 0.0)) *
-        float(room.get("window_u", 0.0)) +
-        float(room.get("wall_area", 0.0)) *
-        float(room.get("wall_u", 0.0)) +
-        float(room.get("roof_area", 0.0)) *
-        float(room.get("roof_u", 0.0)) +
-        float(room.get("floor_exposed_area", 0.0)) *
-        float(room.get("floor_u", 0.0))
+        room_window_area_total(room)
+        * float(room.get("window_u", 0.0)) +
+
+        float(room.get("wall_area", 0.0))
+        * float(room.get("wall_u", 0.0)) +
+
+        float(room.get("roof_area", 0.0))
+        * float(room.get("roof_u", 0.0)) +
+
+        float(room.get("floor_exposed_area", 0.0))
+        * float(room.get("floor_u", 0.0))
     )
 
+def room_ua(room, ach_override=None, temperature=None,
+            humidity_ratio=0.0, pressure=P_ATM):
+    """
+    Calcula la conductancia térmica total de una estancia.
 
-def room_ua(room, ach_override=None):
-    """UA total incluyendo transmisión y ventilación, W/K."""
+    Si se proporcionan temperatura, humedad específica y presión,
+    calcula el UA de ventilación a partir de la masa de aire seco.
+
+    Sin esos parámetros utiliza la aproximación convencional
+    basada en RHO_AIR y CP_AIR.
+    """
+
     ach = (
         float(room.get("air_changes_h", 0.0))
-        if ach_override is None else max(0.0, float(ach_override))
+        if ach_override is None
+        else max(0.0, float(ach_override))
     )
-    ua_vent = VENT_HEAT_W_PER_M3H_K * ach * room_geometry(room)
-    return max(0.0, room_envelope_ua(room) + ua_vent)
 
+    volume = room_geometry(room)
+
+    if temperature is None:
+
+        ua_vent = (
+            VENT_HEAT_W_PER_M3H_K
+            * ach
+            * volume
+        )
+
+    else:
+
+        dry_mass = dry_air_mass(
+            volume,
+            float(temperature),
+            max(0.0, float(humidity_ratio)),
+            pressure
+        )
+
+        cp_moist = (
+            CP_AIR
+            + 1860.0 * max(0.0, float(humidity_ratio))
+        )
+
+        mass_flow_kg_s = (
+            dry_mass * ach / 3600.0
+        )
+
+        ua_vent = (
+            mass_flow_kg_s * cp_moist
+        )
+
+    return max(
+        0.0,
+        room_envelope_ua(room) + ua_vent
+    )
 
 def room_capacity(room, thermal_mass_override=None):
     """Capacidad térmica efectiva de la estancia, J/K."""
@@ -300,8 +380,7 @@ def room_capacity(room, thermal_mass_override=None):
         RHO_AIR * CP_AIR * volume +
         max(0.0, mass_area) * float(room["floor_area"])
     )
-
-
+    
 def exact_thermal_step(t0, tout, ua, capacity, gains_w, dt_s):
     """
     Solución exacta de:
@@ -324,7 +403,576 @@ def exact_thermal_step(t0, tout, ua, capacity, gains_w, dt_s):
         (gains_w / ua) * (1.0 - decay)
     )
 
+def room_window_area_total(room):
+    """
+    Devuelve la superficie total de los huecos acristalados.
 
+    Si existen grupos de ventanas, suma sus superficies.
+    Para configuraciones antiguas utiliza window_area.
+    """
+
+    groups = room.get("window_groups")
+
+    if isinstance(groups, list) and groups:
+        return sum(
+            max(0.0, float(group.get("area_m2", 0.0)))
+            for group in groups
+        )
+
+    return max(
+        0.0,
+        float(room.get("window_area", 0.0))
+    )
+    
+
+def last_sunday_of_month(year, month):
+    """
+    Obtiene la fecha del último domingo de un mes.
+    """
+
+    last_day = calendar.monthrange(year, month)[1]
+
+    last_date = date(
+        year,
+        month,
+        last_day
+    )
+
+    return (
+        last_date
+        - timedelta(days=(last_date.weekday() + 1) % 7)
+    )
+
+
+def solar_utc_offset(day, config):
+    """
+    Obtiene el desfase horario respecto a UTC.
+
+    Por defecto utiliza el horario de España peninsular:
+    UTC+1 en invierno y UTC+2 en verano.
+
+    Puede sobrescribirse mediante solar_utc_offset_hours.
+    """
+
+    configured = config.get("solar_utc_offset_hours")
+
+    if configured is not None:
+        return float(configured)
+
+    dst_start = last_sunday_of_month(
+        day.year, 3
+    )
+
+    dst_end = last_sunday_of_month(
+        day.year, 10
+    )
+
+    if dst_start <= day < dst_end:
+        return 2.0
+
+    return 1.0
+
+
+def solar_position(hour, config, day_offset=0):
+    """
+    Calcula la elevación y azimut solar.
+
+    Devuelve:
+        elevation_deg: elevación solar sobre el horizonte.
+        azimuth_deg: azimut desde el norte, sentido horario.
+        cos_zenith: coseno del ángulo cenital.
+
+    Utiliza fecha, latitud, longitud y hora local.
+    """
+
+    solar_date = str(
+        config.get(
+            "solar_date",
+            date.today().isoformat()
+        )
+    )
+
+    try:
+        base_date = date.fromisoformat(
+            solar_date[:10]
+        )
+    except ValueError:
+        raise ValueError(
+            "solar_date debe tener formato YYYY-MM-DD."
+        )
+    '''
+    local_hour = float(hour) + 0.5
+
+    current_date = (
+        base_date
+        + timedelta(days=int(day_offset))
+    )
+    '''
+    # La radiación horaria de Open-Meteo corresponde a la hora anterior.
+    # Por ejemplo, el dato etiquetado 13:00 representa 12:00-13:00.
+    reference = config.get(
+        "solar_hour_reference",
+        "interval_end"
+    )
+
+    if reference == "interval_end":
+        local_hour = float(hour) - 0.5
+
+    elif reference == "interval_start":
+        local_hour = float(hour) + 0.5
+
+    elif reference == "instant":
+        local_hour = float(hour)
+
+    else:
+        raise ValueError(
+            "solar_hour_reference debe ser interval_end, "
+            "interval_start o instant."
+        )
+
+    adjusted_day_offset = int(day_offset)
+
+    while local_hour < 0.0:
+        local_hour += 24.0
+        adjusted_day_offset -= 1
+
+    while local_hour >= 24.0:
+        local_hour -= 24.0
+        adjusted_day_offset += 1
+
+    current_date = (
+        base_date
+        + timedelta(days=adjusted_day_offset)
+    )
+
+    latitude = float(
+        config.get("latitude_deg", 42.5)
+    )
+
+    longitude = float(
+        config.get("longitude_deg", -8.0)
+    )
+
+    if not -90.0 <= latitude <= 90.0:
+        raise ValueError(
+            "La latitud debe estar entre -90 y 90 grados."
+        )
+
+    if not -180.0 <= longitude <= 180.0:
+        raise ValueError(
+            "La longitud debe estar entre -180 y 180 grados."
+        )
+
+    utc_offset = solar_utc_offset(
+        current_date,
+        config
+    )
+
+    day_of_year = current_date.timetuple().tm_yday
+
+    days_in_year = (
+        366 if calendar.isleap(current_date.year)
+        else 365
+    )
+
+    gamma = (
+        2.0 * math.pi / days_in_year
+        * (
+            day_of_year - 1
+            + (local_hour - 12.0) / 24.0
+        )
+    )
+
+    # Ecuación del tiempo, en minutos.
+    equation_time = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2.0 * gamma)
+        - 0.040849 * math.sin(2.0 * gamma)
+    )
+
+    # Declinación solar, en radianes.
+    declination = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2.0 * gamma)
+        + 0.000907 * math.sin(2.0 * gamma)
+        - 0.002697 * math.cos(3.0 * gamma)
+        + 0.00148 * math.sin(3.0 * gamma)
+    )
+
+    # Tiempo solar verdadero.
+    time_offset = (
+        equation_time
+        + 4.0 * (
+            longitude - 15.0 * utc_offset
+        )
+    )
+
+    true_solar_minutes = (
+        local_hour * 60.0 + time_offset
+    )
+
+    hour_angle = math.radians(
+        true_solar_minutes / 4.0 - 180.0
+    )
+
+    lat_rad = math.radians(latitude)
+
+    cos_zenith = (
+        math.sin(lat_rad) * math.sin(declination)
+        + math.cos(lat_rad)
+        * math.cos(declination)
+        * math.cos(hour_angle)
+    )
+
+    cos_zenith = clamp(
+        cos_zenith,
+        -1.0,
+        1.0
+    )
+
+    elevation = math.degrees(
+        math.asin(cos_zenith)
+    )
+
+    azimuth = (
+        math.degrees(
+            math.atan2(
+                math.sin(hour_angle),
+                (
+                    math.cos(hour_angle)
+                    * math.sin(lat_rad)
+                    - math.tan(declination)
+                    * math.cos(lat_rad)
+                )
+            )
+        )
+        + 180.0
+    ) % 360.0
+
+    return (
+        elevation,
+        azimuth,
+        cos_zenith
+    )
+
+
+def solar_irradiance_on_vertical_facade(
+        ghi, hour, orientation, config, day_offset=0):
+    """
+    Estima la irradiancia solar sobre una fachada vertical.
+
+    Entrada:
+        ghi: irradiancia global horizontal, W/m².
+        orientation: N, NE, E, SE, S, SO, O, NO o azimut numérico.
+
+    Se utiliza una descomposición aproximada de Erbs para estimar
+    radiación difusa y directa a partir de GHI.
+
+    La componente difusa se distribuye mediante el modelo isotrópico
+    de cielo. La reflexión del suelo utiliza solar_ground_reflectance.
+    """
+
+    ghi = max(0.0, float(ghi))
+
+    if ghi <= 0.0:
+        return 0.0
+
+    elevation, sun_azimuth, cos_zenith = solar_position(
+        hour,
+        config,
+        day_offset
+    )
+
+    if elevation <= 0.0 or cos_zenith <= 0.0:
+        return 0.0
+
+    # Orientaciones no especificadas: promedio de las ocho fachadas.
+    if isinstance(orientation, str):
+
+        orientation = orientation.strip().upper()
+
+        if orientation in ("AVERAGE", "MEDIA", "DESCONOCIDA"):
+
+            values = [
+                solar_irradiance_on_vertical_facade(
+                    ghi,
+                    hour,
+                    key,
+                    config,
+                    day_offset
+                )
+                for key in (
+                    "N", "NE", "E", "SE",
+                    "S", "SO", "O", "NO"
+                )
+            ]
+
+            return sum(values) / len(values)
+
+        if orientation not in SOLAR_ORIENTATIONS:
+            raise ValueError(
+                "Orientación solar no válida: %s"
+                % orientation
+            )
+
+        facade_azimuth = SOLAR_ORIENTATIONS[
+            orientation
+        ]
+
+    else:
+        facade_azimuth = float(orientation) % 360.0
+
+    # Irradiancia extraterrestre normal.
+    day = date.fromisoformat(
+        str(config.get(
+            "solar_date",
+            date.today().isoformat()
+        ))[:10]
+    ) + timedelta(days=int(day_offset))
+
+    day_number = day.timetuple().tm_yday
+
+    i0_normal = (
+        1367.0
+        * (
+            1.0
+            + 0.033
+            * math.cos(
+                2.0 * math.pi * day_number / 365.0
+            )
+        )
+    )
+
+    i0_horizontal = (
+        i0_normal * cos_zenith
+    )
+
+    # Índice de claridad atmosférica.
+    kt = clamp(
+        ghi / max(1.0, i0_horizontal),
+        0.0,
+        1.2
+    )
+
+    # Fracción difusa de Erbs.
+    if kt <= 0.22:
+
+        diffuse_fraction = (
+            1.0 - 0.09 * kt
+        )
+
+    elif kt <= 0.80:
+
+        diffuse_fraction = (
+            0.9511
+            - 0.1604 * kt
+            + 4.388 * kt ** 2
+            - 16.638 * kt ** 3
+            + 12.336 * kt ** 4
+        )
+
+    else:
+
+        diffuse_fraction = 0.165
+
+    diffuse_fraction = clamp(
+        diffuse_fraction,
+        0.0,
+        1.0
+    )
+
+    dhi = (
+        ghi * diffuse_fraction
+    )
+
+    # Cerca del horizonte la descomposición directa resulta inestable.
+    if cos_zenith < 0.065:
+
+        dni = 0.0
+        dhi = ghi
+
+    else:
+
+        dni = (
+            max(0.0, ghi - dhi)
+            / cos_zenith
+        )
+
+        dni = min(
+            dni,
+            i0_normal
+        )
+
+    # --------------------------------------------------------------
+    # COMPONENTE DIRECTA SOBRE LA FACHADA VERTICAL
+    # --------------------------------------------------------------
+
+    cos_elevation = math.sqrt(
+        max(0.0, 1.0 - cos_zenith ** 2)
+    )
+
+    incidence_cos = (
+        cos_elevation
+        * math.cos(
+            math.radians(
+                sun_azimuth - facade_azimuth
+            )
+        )
+    )
+
+    direct_plane = (
+        dni * max(0.0, incidence_cos)
+    )
+
+    # --------------------------------------------------------------
+    # COMPONENTE DIFUSA DEL CIELO
+    # --------------------------------------------------------------
+
+    diffuse_plane = (
+        dhi * 0.5
+    )
+
+    # --------------------------------------------------------------
+    # COMPONENTE REFLEJADA POR EL SUELO
+    # --------------------------------------------------------------
+
+    albedo = clamp(
+        float(
+            config.get(
+                "solar_ground_reflectance",
+                0.20
+            )
+        ),
+        0.0,
+        1.0
+    )
+
+    ground_reflected = (
+        ghi * albedo * 0.5
+    )
+
+    return max(
+        0.0,
+        direct_plane
+        + diffuse_plane
+        + ground_reflected
+    )
+
+
+def room_solar_gain_w(room, ghi, config,
+                      hour, day_offset=0):
+    """
+    Calcula las ganancias solares transmitidas a una estancia.
+
+    Cada grupo de ventanas tiene:
+        orientation
+        area_m2
+        g_factor
+        shade_factor
+
+    Las configuraciones antiguas utilizan window_area y una
+    orientación media de las ocho fachadas.
+    """
+
+    if not config.get("solar_enabled", True):
+        return 0.0
+
+    groups = room.get("window_groups")
+
+    if not isinstance(groups, list) or not groups:
+
+        groups = [
+            {
+                "orientation": "AVERAGE",
+                "area_m2": room.get("window_area", 0.0),
+                "g_factor": config.get("solar_factor", 0.55),
+                "shade_factor": config.get(
+                    "solar_shading_factor",
+                    1.0
+                )
+            }
+        ]
+
+    glazing_factor = clamp(
+        float(
+            config.get(
+                "solar_glazing_area_factor",
+                0.90
+            )
+        ),
+        0.0,
+        1.0
+    )
+
+    total_solar_w = 0.0
+
+    for group in groups:
+
+        area = max(
+            0.0,
+            float(group.get("area_m2", 0.0))
+        )
+
+        g_factor = clamp(
+            float(
+                group.get(
+                    "g_factor",
+                    group.get(
+                        "solar_factor",
+                        config.get("solar_factor", 0.55)
+                    )
+                )
+            ),
+            0.0,
+            1.0
+        )
+
+        shade_factor = clamp(
+            float(
+                group.get(
+                    "shade_factor",
+                    config.get(
+                        "solar_shading_factor",
+                        1.0
+                    )
+                )
+            ),
+            0.0,
+            1.0
+        )
+
+        orientation = group.get(
+            "orientation",
+            "AVERAGE"
+        )
+
+        facade_irradiance = (
+            solar_irradiance_on_vertical_facade(
+                ghi,
+                hour,
+                orientation,
+                config,
+                day_offset
+            )
+        )
+
+        effective_area = (
+            area * glazing_factor
+        )
+
+        total_solar_w += (
+            effective_area
+            * g_factor
+            * shade_factor
+            * facade_irradiance
+        )
+
+    return max(0.0, total_solar_w)
+    
 # ---------------------------------------------------------------------------
 # PSICROMETRIA AUXILIAR
 # ---------------------------------------------------------------------------
@@ -366,7 +1014,98 @@ def air_density(temperature, humidity_ratio, pressure):
         pv / (r_vapour * t_k)
     )
 
+def wet_bulb_temperature_c(psych, temperature,
+                          humidity_ratio, pressure):
+    """
+    Calcula la temperatura de bulbo húmedo termodinámica.
 
+    Utiliza CoolProp cuando está disponible.
+    En su ausencia, resuelve el balance de entalpía de saturación
+    mediante bisección.
+
+    No constituye un cálculo PMV ni un índice normalizado de confort.
+    """
+
+    t = float(temperature)
+    w = max(0.0, float(humidity_ratio))
+
+    w_sat = psych.humidity_ratio(
+        t,
+        100.0,
+        pressure
+    )
+
+    if w >= w_sat:
+        return t
+
+    # CoolProp: B representa la temperatura de bulbo húmedo.
+    if getattr(psych, "coolprop", False):
+
+        try:
+            return float(
+                psych._ha(
+                    "B",
+                    "T", t + 273.15,
+                    "P", pressure,
+                    "W", w
+                )
+            ) - 273.15
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------------
+    # Alternativa psicrométrica por balance de entalpía.
+    # Unidades de entalpía: kJ/kg de aire seco.
+    # --------------------------------------------------------------
+
+    h_air = (
+        1.006 * t
+        + w * (2501.0 + 1.86 * t)
+    )
+
+    def residual(t_wb):
+
+        w_sat_wb = psych.humidity_ratio(
+            t_wb,
+            100.0,
+            pressure
+        )
+
+        h_sat = (
+            1.006 * t_wb
+            + w_sat_wb
+            * (2501.0 + 1.86 * t_wb)
+        )
+
+        h_liquid = (
+            4.186 * t_wb
+        )
+
+        return (
+            h_sat
+            - h_air
+            - (w_sat_wb - w) * h_liquid
+        )
+
+    low = -80.0
+    high = t
+
+    for _ in range(70):
+
+        middle = (
+            low + high
+        ) / 2.0
+
+        if residual(middle) > 0.0:
+            high = middle
+        else:
+            low = middle
+
+    return (
+        low + high
+    ) / 2.0
+    
 # ---------------------------------------------------------------------------
 # CONEXIONES ENTRE ESTANCIAS
 # ---------------------------------------------------------------------------
@@ -678,12 +1417,12 @@ def room_occupancy(room, config, hour):
 # BALANCES DE MASA Y ENERGIA
 # ---------------------------------------------------------------------------
 
-def exchange_air_between_rooms(states, connections, rooms, pressure,
-                               dt_s):
+def exchange_air_between_rooms(states, connections, rooms,
+                               pressure, dt_s):
     """
-    Intercambia masa, humedad y energía entre estancias conectadas.
+    Calcula los intercambios bidireccionales de aire entre estancias.
 
-    Modelo de parámetros concentrados:
+    Cada estancia es un volumen de control homogéneo.
       - Cada estancia tiene una temperatura y humedad homogéneas.
       - El intercambio es bidireccional: igual masa de aire seco
         entra y sale de cada estancia conectada.
@@ -691,6 +1430,11 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         de humedad específica.
       - La transferencia energética se calcula mediante la diferencia
         de entalpía del aire húmedo.
+
+    Se conservan:
+      - El balance de masa de aire seco.
+      - El balance de humedad específica.
+      - El transporte de energía sensible.
 
     Todas las transferencias se calculan utilizando los estados
     iniciales del subpaso y se acumulan antes de actualizar las
@@ -708,12 +1452,35 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
 
     dt_s = max(0.0, float(dt_s))
 
-    if dt_s <= 0.0 or not states or not connections:
+    if (
+        dt_s <= 0.0
+        or not states
+        or not connections
+    ):
         return
 
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
     # 1. ESTADOS INICIALES
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
+
+    # Instantánea de las propiedades de cada estancia.
+    # Evita que el orden de las conexiones altere los resultados.
+    snapshots = {}
+
+    for name, state in states.items():
+
+        snapshots[name] = {
+            "temperature": float(state["temperature"]),
+            "w": max(0.0, float(state["w"])),
+            "dry_air_kg": max(
+                0.01,
+                float(state["dry_air_kg"])
+            ),
+            "capacity": max(
+                1.0,
+                float(state["capacity"])
+            )
+        }
 
     moisture_delta = {
         name: 0.0 for name in states
@@ -727,36 +1494,11 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         name: 0.0 for name in states
     }
 
-    # Instantánea de las propiedades de cada estancia.
-    # Evita que el orden de las conexiones altere los resultados.
-    snapshots = {}
-
-    for name, state in states.items():
-
-        snapshots[name] = {
-            "temperature": float(state["temperature"]),
-            "w": max(0.0, float(state["w"])),
-            "dry_air_kg": max(
-                0.01, float(state["dry_air_kg"])
-            ),
-            "capacity": max(
-                1.0, float(state["capacity"])
-            ),
-            "enthalpy": (
-                1.006 * float(state["temperature"]) +
-                max(0.0, float(state["w"])) *
-                (
-                    2501.0 +
-                    1.86 * float(state["temperature"])
-                )
-            )
-        }
-
-    # ---------------------------------------------------------------
-    # 2. CÁLCULO DE LAS TRANSFERENCIAS SOLICITADAS
-    # ---------------------------------------------------------------
-
     transfers = []
+
+    # --------------------------------------------------------------
+    # 2. CAUDALES Y MASAS INTERCAMBIADAS
+    # --------------------------------------------------------------
 
     for connection in connections:
 
@@ -764,24 +1506,21 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         name_b = connection.get("room_b")
 
         if (
-            name_a not in states or
-            name_b not in states or
-            name_a == name_b
+            name_a not in states
+            or name_b not in states
+            or name_a == name_b
         ):
             continue
 
-        state_a = states[name_a]
-        state_b = states[name_b]
-
-        room_a = rooms[name_a]
-        room_b = rooms[name_b]
+        a = snapshots[name_a]
+        b = snapshots[name_b]
 
         q_total = connection_exchange_m3_h(
             connection,
-            state_a,
-            state_b,
-            room_a,
-            room_b,
+            states[name_a],
+            states[name_b],
+            rooms[name_a],
+            rooms[name_b],
             pressure
         )
 
@@ -795,9 +1534,6 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
 
         if exchanged_volume <= 0.0:
             continue
-
-        a = snapshots[name_a]
-        b = snapshots[name_b]
 
         # Masa seca equivalente asociada al volumen intercambiado
         # en cada estancia.
@@ -824,11 +1560,13 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         if exchanged_dry_mass <= 0.0:
             continue
 
-        transfers.append((
-            name_a,
-            name_b,
-            exchanged_dry_mass
-        ))
+        transfers.append(
+            (
+                name_a,
+                name_b,
+                exchanged_dry_mass
+            )
+        )
 
         requested_mass[name_a] += exchanged_dry_mass
         requested_mass[name_b] += exchanged_dry_mass
@@ -836,9 +1574,9 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
     if not transfers:
         return
 
-    # ---------------------------------------------------------------
-    # 3. LIMITACIÓN DEL INTERCAMBIO POR ESTANCIA
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 3. LIMITACIÓN CONJUNTA POR ESTANCIA
+    # --------------------------------------------------------------
 
     # Cada estancia dispone de una fracción limitada de su masa
     # de aire seco para el intercambio durante el subpaso.
@@ -852,14 +1590,19 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
 
         requested = requested_mass[name]
 
-        if requested > available_mass and requested > 0.0:
-            scale[name] = available_mass / requested
+        if (
+            requested > available_mass
+            and requested > 0.0
+        ):
+            scale[name] = (
+                available_mass / requested
+            )
         else:
             scale[name] = 1.0
 
-    # ---------------------------------------------------------------
-    # 4. ACUMULACIÓN DE HUMEDAD Y ENERGÍA
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 4. BALANCES DE MASA Y ENERGÍA
+    # --------------------------------------------------------------
 
     for name_a, name_b, requested in transfers:
 
@@ -869,38 +1612,50 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         # La transferencia se limita aplicando el factor más
         # restrictivo de las dos estancias conectadas.
         exchanged_dry_mass = (
-            requested *
-            min(scale[name_a], scale[name_b])
+            requested
+            * min(
+                scale[name_a],
+                scale[name_b]
+            )
         )
 
         if exchanged_dry_mass <= 0.0:
             continue
 
-        # -----------------------------------------------------------
-        # BALANCE DE HUMEDAD
-        # -----------------------------------------------------------
+        # ----------------------------------------------------------
+        # Balance de humedad.
+        # ----------------------------------------------------------
 
         # A recibe el aire de B y entrega su propio aire a B.
         moisture_a = (
-            exchanged_dry_mass *
-            (b["w"] - a["w"])
+            exchanged_dry_mass
+            * (b["w"] - a["w"])
         )
 
         moisture_delta[name_a] += moisture_a
         moisture_delta[name_b] -= moisture_a
 
-        # -----------------------------------------------------------
-        # BALANCE DE ENERGÍA
-        # -----------------------------------------------------------
-
-        # Diferencia de entalpía del aire húmedo:
-        # kJ/kg de aire seco.
+        # ----------------------------------------------------------
+        # Balance sensible.
         #
+        # CP_AIR + 1860*w representa el calor específico sensible
+        # del aire húmedo por kg de aire seco.
+        #
+        # No se incorpora el término latente 2501*w.
         # La transferencia se expresa en J.
-        cp_moist_a = CP_AIR + 1860.0 * a["w"]
-        cp_moist_b = CP_AIR + 1860.0 * b["w"]
+        # ----------------------------------------------------------
 
-        cp_exchange = 0.5 * (cp_moist_a + cp_moist_b)
+        cp_moist_a = (
+            CP_AIR + 1860.0 * a["w"]
+        )
+
+        cp_moist_b = (
+            CP_AIR + 1860.0 * b["w"]
+        )
+
+        cp_exchange = (
+            cp_moist_a + cp_moist_b
+        ) / 2.0
 
         energy_a = (
             exchanged_dry_mass
@@ -911,9 +1666,9 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         energy_delta[name_a] += energy_a
         energy_delta[name_b] -= energy_a
 
-    # ---------------------------------------------------------------
-    # 5. ACTUALIZACIÓN SIMULTÁNEA DE LAS ESTANCIAS
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 5. APLICACIÓN SIMULTÁNEA
+    # --------------------------------------------------------------
 
     for name, state in states.items():
 
@@ -922,24 +1677,26 @@ def exchange_air_between_rooms(states, connections, rooms, pressure,
         dry_mass = snapshot["dry_air_kg"]
         capacity = snapshot["capacity"]
 
-        # Actualización de la humedad específica.
         state["w"] = max(
             0.0,
-            snapshot["w"] +
-            moisture_delta[name] / dry_mass
+            snapshot["w"]
+            + moisture_delta[name] / dry_mass
         )
 
         # Actualización de la temperatura.
         # La energía intercambiada se distribuye sobre la capacidad
         # térmica efectiva del nodo concentrado.
         state["temperature"] = (
-            snapshot["temperature"] +
-            energy_delta[name] / capacity
+            snapshot["temperature"]
+            + energy_delta[name] / capacity
         )
 
-        # Se recalcula la masa seca con las nuevas condiciones
-        # psicrométricas y el volumen constante de la estancia.
-        update_dry_air_mass(state, pressure)
+        # La masa seca se recalcula con el estado termodinámico
+        # actualizado y el volumen constante de la estancia.
+        update_dry_air_mass(
+            state,
+            pressure
+        )
 
 def apply_condensation(state, psych, pressure):
     """Condensación del exceso sobre saturación. Devuelve la masa condensada."""
@@ -975,18 +1732,35 @@ def simulate_room_substep(room, state, config, weather,
     La duración efectiva de funcionamiento se calcula dentro del
     subpaso, sin modular la potencia nominal.
 
+    Variables de estado:
+        temperature: temperatura seca, °C.
+        w: humedad específica, kg vapor/kg aire seco.
+
+    La HR se obtiene de T y w mediante las funciones psicrométricas.
+
     La humedad objetivo se determina a partir de la temperatura
     y humedad relativa de consigna, manteniendo constante la
     humedad específica objetivo durante toda la simulación.
 
+    La ventilación se incorpora como conductancia térmica adicional.
+    Su balance de humedad se resuelve exponencialmente.
     La ventilación intercambia masa de aire y energía sensible.
+
+    Los equipos trabajan a potencia fija o apagados:
+        - calefacción: potencia configurada o cero.
+        - deshumidificador: capacidad de extracción o apagado.
+
+    Las ganancias térmicas del deshumidificador incluyen:
+        - electricidad consumida, ajustada por dehumidifier_heat_factor.
+        - calor latente recuperado por la condensación del vapor.
+
     No se utiliza la entalpía completa para convertir el contenido
     latente de vapor en variaciones de temperatura.
     """
 
-    # ------------------------------------------------------------------
-    # 1. CONDICIONES INICIALES Y PARÁMETROS GENERALES
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 1. CONDICIONES INICIALES
+    # --------------------------------------------------------------
 
     pressure = float(config["pressure_pa"])
 
@@ -995,7 +1769,10 @@ def simulate_room_substep(room, state, config, weather,
 
     tout = float(weather["temperature"])
     rhout = float(weather["rh"])
-    solar = max(0.0, float(weather["solar"]))
+    solar_ghi = max(
+        0.0,
+        float(weather["solar"])
+    )
 
     wout = psych.humidity_ratio(
         tout,
@@ -1004,7 +1781,11 @@ def simulate_room_substep(room, state, config, weather,
     )
 
     volume = float(state["volume"])
-    dry_mass = max(0.01, float(state["dry_air_kg"]))
+
+    dry_mass = max(
+        0.01,
+        float(state["dry_air_kg"])
+    )
 
     dt_s = float(dt_s)
 
@@ -1029,8 +1810,8 @@ def simulate_room_substep(room, state, config, weather,
         config["target_rh"]
     )
 
-    # Humedad específica correspondiente a las dos consignas.
-    # No depende de la temperatura instantánea de la estancia.
+    # Humedad específica de consigna, calculada a la temperatura
+    # de consigna y no a la temperatura instantánea.
     target_w = psych.humidity_ratio(
         target_temperature,
         target_rh,
@@ -1118,7 +1899,7 @@ def simulate_room_substep(room, state, config, weather,
                 room,
                 config,
                 "dehumidifier_heat_factor",
-                1.0
+                config.get("dehumidifier_heat_factor", 1.0)
             )
         ),
         0.0,
@@ -1143,9 +1924,9 @@ def simulate_room_substep(room, state, config, weather,
         )
     )
 
-    # ------------------------------------------------------------------
-    # 3. VENTILACIÓN EXTERIOR
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 3. VENTILACIÓN Y BALANCE DE HUMEDAD
+    # --------------------------------------------------------------
 
     # Renovaciones permanentes de la estancia.
     # Representan infiltración/ventilación base, no un equipo activable.
@@ -1163,7 +1944,7 @@ def simulate_room_substep(room, state, config, weather,
     if "_window_airflow" in state:
         q_window = max(
             0.0,
-            float(state["_window_airflow"])
+            float(state.get("_window_airflow", 0.0))
         )
     else:
         q_window = window_airflow(
@@ -1173,7 +1954,7 @@ def simulate_room_substep(room, state, config, weather,
 
         state["_window_airflow"] = q_window
 
-    # Caudal disponible expresado como renovaciones/hora.
+    # Caudal máximo disponible por la apertura configurada expresado como renovaciones/hora.
     ach_window_available = (
         q_window / max(0.1, volume)
     )
@@ -1186,9 +1967,15 @@ def simulate_room_substep(room, state, config, weather,
         float(config.get("ventilation_max_ach", 2.0))
     )
 
+    # La ventilación adicional nunca puede superar:
+    #   - El caudal de ventana disponible.
+    #   - El límite global de ACH.
     ach_window_limit = min(
         ach_window_available,
-        max(0.0, ventilation_max_ach - ach_base)
+        max(
+            0.0,
+            ventilation_max_ach - ach_base
+        )
     )
 
     ventilation_control = bool(
@@ -1197,11 +1984,11 @@ def simulate_room_substep(room, state, config, weather,
 
     if ventilation_control:
 
-        # Ventilación automática:
-        # se activa únicamente cuando la humedad específica interior
-        # supera la consigna y el aire exterior es más seco.
+        # La ventilación automática funciona cuando:
+        #   - La humedad interior supera la consigna.
+        #   - El exterior tiene menor humedad específica.
         #
-        # El caudal adicional máximo queda limitado por las ventanas.
+        # Su caudal máximo es el que permite la apertura configurada.
         ach_window_used = ventilation_control_ach(
             w,
             wout,
@@ -1213,22 +2000,38 @@ def simulate_room_substep(room, state, config, weather,
 
     else:
 
-        # Sin control automático, las ventanas configuradas como
-        # abiertas producen el intercambio correspondiente
-        # durante todo el subpaso.
+        # Si el control automático está deshabilitado,
+        # la ventana configurada como abierta produce su caudal manual.
         ach_window_used = ach_window_limit
 
     # Renovación total efectiva solicitada.
-    ach_total = ach_base + ach_window_used
+    ach_total = (
+        ach_base + ach_window_used
+    )
 
     ventilation_w = 0.0
 
     if ach_total > 0.0:
 
+        # Solución exponencial del balance de humedad para un caudal
+        # constante durante todo el subpaso.
+        decay = math.exp(
+            -ach_total * dt_h
+        )
+
+        # Balance exponencial de humedad.
+        w = (
+            wout
+            + (w - wout) * decay
+        )
+
+        w = max(0.0, w)
+
+
         # Fracción de aire sustituida durante el subpaso.
         # Se obtiene de la solución exponencial para ACH constante.
         exchange_fraction = (
-            1.0 - math.exp(-ach_total * dt_h)
+            1.0 - decay
         )
 
         # Límite de estabilidad para intercambios muy elevados.
@@ -1239,20 +2042,10 @@ def simulate_room_substep(room, state, config, weather,
             max(0.0, exchange_fraction)
         )
 
-        decay = 1.0 - exchange_fraction
-
         # Masa seca intercambiada durante el subpaso.
         exchanged_dry_mass = (
             dry_mass * exchange_fraction
         )
-
-        # Balance exponencial de humedad.
-        w = (
-            wout +
-            (w - wout) * decay
-        )
-
-        w = max(0.0, w)
 
         # Capacidad calorífica específica sensible del aire húmedo.
         # Se utiliza un valor medio entre el aire interior y exterior.
@@ -1280,13 +2073,6 @@ def simulate_room_substep(room, state, config, weather,
             ventilation_energy_j / dt_s
         )
 
-        # Si se ha aplicado el límite de estabilidad, el caudal
-        # contabilizado debe corresponder a la fracción realmente
-        # intercambiada.
-        ach_total = (
-            -math.log(decay) / dt_h
-        )
-
         state["ventilation_m3"] += (
             ach_total * volume * dt_h
         )
@@ -1294,13 +2080,17 @@ def simulate_room_substep(room, state, config, weather,
     # El contador de minutos refleja la ventilación adicional
     # por ventanas, no las renovaciones base permanentes.
     if ach_window_used > 0.0:
+
+        # Solo se contabiliza como tiempo de ventilación activa
+        # la parte adicional correspondiente a ventanas/control.
+        # Las renovaciones base son permanentes.
         state["ventilation_minutes"] += (
             dt_h * 60.0
         )
 
-    # ------------------------------------------------------------------
-    # 4. OCUPACIÓN Y GENERACIÓN INTERNA DE HUMEDAD
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 4. OCUPACIÓN Y GENERACIÓN DE HUMEDAD
+    # --------------------------------------------------------------
 
     people = room_occupancy(
         room,
@@ -1310,19 +2100,14 @@ def simulate_room_substep(room, state, config, weather,
 
     moisture_per_person = max(
         0.0,
-        float(
-            config.get("moisture_per_person_g_h", 0.0)
-        )
+        float(config.get("moisture_per_person_g_h", 0.0))
     )
 
     sensible_gain_per_person = max(
         0.0,
-        float(
-            config.get("sensible_gain_per_person_w", 0.0)
-        )
+        float(config.get("sensible_gain_per_person_w", 0.0))
     )
 
-    # Generación de vapor de agua por ocupación.
     moisture_kg = (
         people
         * moisture_per_person
@@ -1330,7 +2115,9 @@ def simulate_room_substep(room, state, config, weather,
         * dt_h
     )
 
-    w += moisture_kg / dry_mass
+    w += (
+        moisture_kg / dry_mass
+    )
 
     # Ganancias sensibles por ocupación y otros equipos internos.
     sensible_w = (
@@ -1338,33 +2125,21 @@ def simulate_room_substep(room, state, config, weather,
         + internal_gain_w
     )
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # 5. GANANCIA SOLAR
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
-    solar_w = 0.0
+    solar_w = room_solar_gain_w(
+        room,
+        solar_ghi,
+        config,
+        int(weather["hour"]),
+        int(hour) // 24
+    )
 
-    if config.get("solar_enabled", True):
-
-        solar_factor = max(
-            0.0,
-            float(config.get("solar_factor", 0.55))
-        )
-
-        window_area = max(
-            0.0,
-            float(room.get("window_area", 0.0))
-        )
-
-        solar_w = (
-            solar
-            * window_area
-            * solar_factor
-        )
-
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # 6. DESHUMIDIFICACIÓN
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
     extracted_kg = 0.0
     dehum_minutes = 0.0
@@ -1402,15 +2177,22 @@ def simulate_room_substep(room, state, config, weather,
             and cap_kg_h > 0.0
         ):
 
-            # El equipo trabaja a su capacidad nominal efectiva
-            # mientras exista humedad por encima del objetivo.
+            # Extracción limitada por la capacidad del aparato
+            # y por la cantidad de agua que excede la consigna.
             extracted_kg = min(
                 excess_kg,
                 cap_kg_h * dt_h
             )
 
-            w -= extracted_kg / dry_mass
+            w -= (
+                extracted_kg / dry_mass
+            )
+
             w = max(0.0, w)
+
+            state["dehumidified_kg"] += (
+                extracted_kg
+            )
 
             # Tiempo real de funcionamiento dentro del subpaso.
             # Se desconecta cuando alcanza la consigna.
@@ -1419,13 +2201,11 @@ def simulate_room_substep(room, state, config, weather,
                 extracted_kg / cap_kg_h * 60.0
             )
 
-            state["dehumidified_kg"] += extracted_kg
-
             state["dehumidifier_minutes"] += (
                 dehum_minutes
             )
 
-            # Energía eléctrica realmente consumida.
+            # Energía eléctrica consumida.
             dehum_electric_kwh = (
                 dehumidifier_power_kw
                 * dehum_minutes / 60.0
@@ -1442,46 +2222,78 @@ def simulate_room_substep(room, state, config, weather,
                 dehum_minutes / (dt_h * 60.0)
             )
 
-            # Ganancia sensible asociada al consumo eléctrico.
-            electric_heat_w = dehumidifier_power_kw * 1000.0 * dehumidifier_heat_factor * duty_fraction
-            # Calor latente recuperado por la condensación del vapor extraído.
+            # Ganancia sensible debida al consumo eléctrico.
+            electric_heat_w = (
+                dehumidifier_power_kw
+                * 1000.0
+                * dehumidifier_heat_factor
+                * duty_fraction
+            )
+
+            # Calor latente recuperado al condensar el vapor extraído.
             # Se distribuye sobre la duración completa del subpaso.
-            latent_heat_w = (extracted_kg * H_FG) / dt_s
-            # Ganancia térmica total del deshumidificador.
-            dehum_heat_w = electric_heat_w + latent_heat_w
+            latent_heat_w = (
+                extracted_kg * H_FG
+            ) / dt_s
 
-    # ------------------------------------------------------------------
-    # 7. BALANCE TÉRMICO SIN CALEFACCIÓN
-    # ------------------------------------------------------------------
+            dehum_heat_w = (
+                electric_heat_w
+                + latent_heat_w
+            )
 
-    # UA únicamente de la envolvente.
-    # Las pérdidas por ventilación ya están contabilizadas
-    # mediante ventilation_w.
-    ua = max(
+    # --------------------------------------------------------------
+    # 7. CONDUCTANCIA TÉRMICA DE ENVOLVENTE Y VENTILACIÓN
+    # --------------------------------------------------------------
+
+    ua_envelope = max(
         0.0,
         float(state["ua_envelope"])
     )
 
+    # Estado medio representativo del aire intercambiado.
+    mean_temperature = (
+        t + tout
+    ) / 2.0
+
+    mean_w = (
+        max(0.0, w)
+        + max(0.0, wout)
+    ) / 2.0
+
+    ua_total = room_ua(
+        room,
+        ach_override=ach_total,
+        temperature=mean_temperature,
+        humidity_ratio=mean_w,
+        pressure=pressure
+    )
+
+    ua_vent = max(
+        0.0,
+        ua_total - ua_envelope
+    )
+
+    # Las ganancias térmicas no contienen un término adicional
+    # de ventilación: su efecto ya está incluido en UA_total.
     gains_without_heating = (
         sensible_w
         + solar_w
         + dehum_heat_w
-        + ventilation_w
     )
 
-    # Temperatura final si la calefacción permaneciera apagada.
+    # Temperatura que se alcanzaría sin calefacción.
     t_free = exact_thermal_step(
         t,
         tout,
-        ua,
+        ua_total,
         capacity,
         gains_without_heating,
         dt_s
     )
 
-    # ------------------------------------------------------------------
-    # 8. CALEFACCIÓN: FUNCIONAMIENTO BINARIO A POTENCIA FIJA
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 8. CALEFACCIÓN A POTENCIA FIJA
+    # --------------------------------------------------------------
 
     heater_power_w = (
         heater_kw * 1000.0
@@ -1505,17 +2317,18 @@ def simulate_room_substep(room, state, config, weather,
             dt_s
         )
 
-        off_seconds = dt_s - on_seconds
+        off_seconds = (
+            dt_s - on_seconds
+        )
 
         temperature = t
 
-        # Primera fase: calefacción encendida.
         if on_seconds > 1e-9:
 
             temperature = exact_thermal_step(
                 temperature,
                 tout,
-                ua,
+                ua_total,
                 capacity,
                 gains_without_heating + heater_power_w,
                 on_seconds
@@ -1527,7 +2340,7 @@ def simulate_room_substep(room, state, config, weather,
             temperature = exact_thermal_step(
                 temperature,
                 tout,
-                ua,
+                ua_total,
                 capacity,
                 gains_without_heating,
                 off_seconds
@@ -1566,16 +2379,18 @@ def simulate_room_substep(room, state, config, weather,
 
             for _ in range(50):
 
-                mid = (low + high) / 2.0
+                middle = (
+                    low + high
+                ) / 2.0
 
-                t_mid = temperature_after_heater(
-                    mid
+                t_middle = temperature_after_heater(
+                    middle
                 )
 
-                if t_mid < target_temperature:
-                    low = mid
+                if t_middle < target_temperature:
+                    low = middle
                 else:
-                    high = mid
+                    high = middle
 
             heater_on_seconds = (
                 low + high
@@ -1594,9 +2409,9 @@ def simulate_room_substep(room, state, config, weather,
         * heater_on_seconds / dt_s
     )
 
-    # ------------------------------------------------------------------
-    # 9. HUMEDAD GENERADA POR LA COMBUSTIÓN
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 9. HUMEDAD GENERADA POR COMBUSTIÓN
+    # --------------------------------------------------------------
 
     combustion_g = 0.0
 
@@ -1633,9 +2448,9 @@ def simulate_room_substep(room, state, config, weather,
             combustion_g / 1000.0
         ) / dry_mass
 
-    # ------------------------------------------------------------------
-    # 10. ENERGÍA CONSUMIDA POR CALEFACCIÓN
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 10. CONSUMO ENERGÉTICO DE CALEFACCIÓN
+    # --------------------------------------------------------------
 
     heater_kwh = heater_energy_kwh(
         heater_kwh_th,
@@ -1664,9 +2479,9 @@ def simulate_room_substep(room, state, config, weather,
             heater_on_seconds / 60.0
         )
 
-    # ------------------------------------------------------------------
-    # 11. ACTUALIZACIÓN DEL ESTADO Y CONDENSACIÓN
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 11. ACTUALIZACIÓN Y CONDENSACIÓN
+    # --------------------------------------------------------------
 
     state["temperature"] = t_new
     state["w"] = max(0.0, w)
@@ -1699,30 +2514,44 @@ def simulate_room_substep(room, state, config, weather,
         pressure
     )
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # 12. RESULTADO DEL SUBPASO
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
     return {
         "people": people,
+
+        "solar_ghi": solar_ghi,
         "solar_w": solar_w,
-        "ua": ua,
+
+        "ua": ua_total,
+        "ua_envelope": ua_envelope,
+        "ua_vent": ua_vent,
+
         "heater_w": heater_w,
         "heater_on_w": (
-            heater_power_w if heater_on_seconds > 0.0 else 0.0
+            heater_power_w
+            if heater_on_seconds > 0.0
+            else 0.0
         ),
         "heater_kw": heater_kw,
-        "heater_on_minutes": heater_on_seconds / 60.0,
+        "heater_on_minutes": (
+            heater_on_seconds / 60.0
+        ),
+
         "dehum_heat_w": dehum_heat_w,
         "dehum_minutes": dehum_minutes,
+        "dehum_kg": extracted_kg,
+
         "combustion_g": combustion_g,
+
         "ventilation_ach": ach_total,
         "ventilation_window_ach": ach_window_used,
         "ventilation_w": ventilation_w,
         "heater_kwh_th": heater_kwh_th,
         "heating_type": heating_type
     }
-    
+
 # ---------------------------------------------------------------------------
 # RESULTADOS HORARIOS
 # ---------------------------------------------------------------------------
@@ -1738,68 +2567,183 @@ def counter_delta(state, key):
 
 def room_hour_result(room, state, config, psych, weather,
                      hour, hour_data):
-    """Construye el resultado horario de una estancia.
+    """
+    Construye el resultado horario de una estancia.
+
+    tin, rh y w_g_kg:
+        Estado al final de la hora.
+
+    tin_avg, rh_avg y w_g_kg_avg:
+        Condiciones medias durante los subpasos de esa hora.
+
+    wet_bulb_c:
+        Temperatura de bulbo húmedo calculada con las condiciones
+        medias horarias. Se utiliza como indicador higrotérmico
+        comparativo, no como PMV.
 
     Los consumos, caudales y minutos son el incremento de esa hora,
     no el total desde el inicio de la simulación. Los campos *_total
     conservan el acumulado.
     """
+
     pressure = float(config["pressure_pa"])
 
-    t = state["temperature"]
-    w = state["w"]
+    # --------------------------------------------------------------
+    # ESTADO FINAL
+    # --------------------------------------------------------------
+
+    t = float(state["temperature"])
+    w = max(0.0, float(state["w"]))
 
     rh = psych.relative_humidity(t, w, pressure)
     dew = psych.dew_point(t, w, pressure)
 
+    # --------------------------------------------------------------
+    # MEDIAS HORARIAS
+    # --------------------------------------------------------------
+
+    samples = max(
+        1,
+        int(hour_data.get("samples", 1))
+    )
+
+    t_avg = (
+        hour_data.get("temperature_sum", t)
+        / samples
+    )
+
+    w_avg = max(
+        0.0,
+        hour_data.get("humidity_ratio_sum", w)
+        / samples
+    )
+
+    rh_avg = psych.relative_humidity(
+        t_avg,
+        w_avg,
+        pressure
+    )
+
+    wet_bulb = wet_bulb_temperature_c(
+        psych,
+        t_avg,
+        w_avg,
+        pressure
+    )
+
+    # --------------------------------------------------------------
+    # INDICADOR DE CONDENSACIÓN SUPERFICIAL
+    # --------------------------------------------------------------
+
     tout = float(weather["temperature"])
 
-    t_surface = (
-        t -
-        (t - tout) *
-        (1.0 - float(config.get("surface_factor", 0.75)))
+    surface_factor = clamp(
+        float(config.get("surface_factor", 0.75)),
+        0.0,
+        1.0
     )
+
+    t_surface = (
+        t
+        - (t - tout) * (1.0 - surface_factor)
+    )
+
+    # --------------------------------------------------------------
+    # RESULTADO
+    # --------------------------------------------------------------
 
     result = {
         "hour": hour,
+
         "tout": tout,
         "rhout": float(weather["rh"]),
+
+        # Radiación global horizontal exterior.
         "solar": float(weather["solar"]),
+
+        # Estado final.
         "tin": t,
         "rh": rh,
         "w_g_kg": w * 1000.0,
+
+        # Medias horarias.
+        "tin_avg": t_avg,
+        "rh_avg": rh_avg,
+        "w_g_kg_avg": w_avg * 1000.0,
+
+        # Indicador higrotérmico comparativo.
+        "wet_bulb_c": wet_bulb,
+        "hygrothermal_index_c": wet_bulb,
+
+        # Punto de rocío y condensación superficial estimada.
         "dew": dew,
         "surface": t_surface,
         "condensation": t_surface <= dew,
+
+        # Condensación efectiva en el aire.
         "condensate_kg": state["condensate_hour_kg"],
         "condensate_total_kg": state["condensate_kg"],
-        "dehum_kg": counter_delta(state, "dehumidified_kg"),
+
+        # Deshumidificación.
+        "dehum_kg": counter_delta(
+            state, "dehumidified_kg"
+        ),
         "dehum_kg_total": state["dehumidified_kg"],
-        "dehum_kwh": counter_delta(state, "dehumidifier_kwh"),
+
+        "dehum_kwh": counter_delta(
+            state, "dehumidifier_kwh"
+        ),
         "dehum_kwh_total": state["dehumidifier_kwh"],
-        "heater_kwh": counter_delta(state, "heater_kwh"),
-        "heater_kwh_total": state["heater_kwh"],
-        "heater_kwh_th": counter_delta(state, "heater_kwh_th"),
-        "heater_kwh_th_total": state["heater_kwh_th"],
-        "heater_butane_kg": counter_delta(state, "heater_butane_kg"),
-        "heater_butane_kg_total": state["heater_butane_kg"],
-        "ventilation_m3": counter_delta(state, "ventilation_m3"),
-        "ventilation_m3_total": state["ventilation_m3"],
-        "vent_min": counter_delta(state, "ventilation_minutes"),
-        "vent_min_total": state["ventilation_minutes"],
-        "dehum_min": counter_delta(state, "dehumidifier_minutes"),
+
+        "dehum_min": counter_delta(
+            state, "dehumidifier_minutes"
+        ),
         "dehum_min_total": state["dehumidifier_minutes"],
-        "heat_min": counter_delta(state, "heater_minutes"),
+
+        # Calefacción.
+        "heater_kwh": counter_delta(
+            state, "heater_kwh"
+        ),
+        "heater_kwh_total": state["heater_kwh"],
+
+        "heater_kwh_th": counter_delta(
+            state, "heater_kwh_th"
+        ),
+        "heater_kwh_th_total": state["heater_kwh_th"],
+
+        "heater_butane_kg": counter_delta(
+            state, "heater_butane_kg"
+        ),
+        "heater_butane_kg_total": state["heater_butane_kg"],
+
+        "heat_min": counter_delta(
+            state, "heater_minutes"
+        ),
         "heat_min_total": state["heater_minutes"],
+
+        # Ventilación.
+        "ventilation_m3": counter_delta(
+            state, "ventilation_m3"
+        ),
+        "ventilation_m3_total": state["ventilation_m3"],
+
+        "vent_min": counter_delta(
+            state, "ventilation_minutes"
+        ),
+        "vent_min_total": state["ventilation_minutes"],
+
+        # Estado físico de la estancia.
         "dry_air_kg": state["dry_air_kg"],
         "ua": hour_data["ua"],
         "capacity_mj_k": state["capacity"] / 1000000.0,
+
+        # Ganancia solar media de la hora.
         "solar_w": hour_data["solar_w"],
+
         "people": hour_data["people"]
     }
 
     return result
-
 
 # ---------------------------------------------------------------------------
 # SIMULACION MULTIESTANCIA
@@ -1851,107 +2795,152 @@ def normalize_connections(config, room_names):
 
     return connections
 
-
 def simulate(config, selected_room=None, hours=24, substep_minutes=5):
     """
-    Simula la evolución térmica e higrométrica de una vivienda.
+    Simula la vivienda completa, manteniendo todas las estancias
+    y sus conexiones.
 
     selected_room:
-        None -> simula todas las estancias conectadas.
-        int  -> simula exclusivamente la estancia indicada.
+        None -> presenta los resultados globales.
+        int  -> presenta los resultados de la estancia por índice.
+        str  -> presenta los resultados de la estancia por nombre.
 
-    hours:
-        Número de horas a simular.
+    La selección NO altera el proceso físico de simulación.
 
-    substep_minutes:
-        Resolución interna de integración. Por defecto, 5 minutos.
+    Aunque se solicite una única estancia, todas las habitaciones
+    conectadas participan en la evolución de sus estados.
 
     Devuelve:
-        {
-            "room": etiqueta,
-            "results": resultados horarios (modo estancia),
-            "rooms": resultados por estancia,
-            "ua": UA de referencia,
-            "volume": volumen,
-            "capacity": capacidad térmica
-        }
+        results:
+            Resultados de la vista seleccionada.
+
+        global_results:
+            Resultados globales de toda la vivienda.
+
+        rooms:
+            Resultados horarios de cada estancia.
+
+        room_results:
+            Resumen final de todas las estancias.
     """
+
     psych = Psychrometrics()
 
-    rooms_cfg = config["rooms"]
+    rooms_cfg = copy.deepcopy(
+        config.get("rooms", [])
+    )
 
     if not rooms_cfg:
-        raise ValueError("No hay estancias configuradas.")
+        raise ValueError(
+            "No hay estancias configuradas."
+        )
 
-    if len(config["weather"]) < 24:
+    if len(config.get("weather", [])) < 24:
         raise ValueError(
             "El perfil meteorológico debe contener 24 horas."
         )
 
+    hours = int(hours)
+    substep_minutes = float(substep_minutes)
+
+    if hours <= 0:
+        raise ValueError(
+            "El número de horas debe ser positivo."
+        )
+
     if substep_minutes <= 0:
-        raise ValueError("El subpaso debe ser positivo.")
+        raise ValueError(
+            "El subpaso debe ser positivo."
+        )
 
-    # ---------------------------------------------------------------
-    # SELECCION DE ESTANCIAS
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 1. PREPARACIÓN DE TODAS LAS ESTANCIAS
+    # --------------------------------------------------------------
 
-    if selected_room is None:
-        selected_rooms = copy.deepcopy(rooms_cfg)
-        room_label = "TODA LA VIVIENDA"
-    else:
-        if selected_room < 0 or selected_room >= len(rooms_cfg):
-            raise ValueError("Índice de estancia no válido.")
+    room_names_list = [
+        room["name"]
+        for room in rooms_cfg
+    ]
 
-        selected_rooms = [
-            copy.deepcopy(rooms_cfg[selected_room])
-        ]
-
-        room_label = selected_rooms[0]["name"]
+    if len(set(room_names_list)) != len(room_names_list):
+        raise ValueError(
+            "Hay nombres de estancia duplicados."
+        )
 
     room_map = {
-        room["name"]: room for room in selected_rooms
+        room["name"]: room
+        for room in rooms_cfg
     }
 
-    room_names = set(room_map.keys())
-
-    connections = normalize_connections(
-        config, room_names
+    room_names = set(
+        room_map.keys()
     )
 
-    # ---------------------------------------------------------------
-    # ESTADOS INICIALES
-    # ---------------------------------------------------------------
+    # Todas las conexiones se mantienen.
+    connections = normalize_connections(
+        config,
+        room_names
+    )
+
+    # --------------------------------------------------------------
+    # 2. INICIALIZACIÓN DE ESTADOS
+    # --------------------------------------------------------------
 
     states = {}
 
-    for room in selected_rooms:
+    for room in rooms_cfg:
+
         states[room["name"]] = create_room_state(
-            room, config, psych
+            room,
+            config,
+            psych
         )
 
     results_by_room = {
-        room["name"]: [] for room in selected_rooms
+        room["name"]: []
+        for room in rooms_cfg
     }
 
-    # ---------------------------------------------------------------
-    # INTEGRACION TEMPORAL
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 3. RESOLUCIÓN TEMPORAL
+    # --------------------------------------------------------------
 
-    dt_s = substep_minutes * 60.0
-    steps_per_hour = int(round(3600.0 / dt_s))
+    dt_s = (
+        substep_minutes * 60.0
+    )
 
-    if abs(steps_per_hour * dt_s - 3600.0) > 1e-6:
+    steps_per_hour = int(
+        round(3600.0 / dt_s)
+    )
+
+    if (
+        abs(steps_per_hour * dt_s - 3600.0)
+        > 1e-6
+    ):
         raise ValueError(
             "El subpaso debe dividir exactamente una hora."
         )
 
-    for hour in range(int(hours)):
-        wx_row = config["weather"][hour % 24]
-        weather = normalize_weather_row(wx_row)
+    # --------------------------------------------------------------
+    # 4. SIMULACIÓN HORARIA
+    # --------------------------------------------------------------
 
-        # Reinicio de acumuladores horarios.
+    for hour in range(hours):
+
+        wx_row = config["weather"][hour % 24]
+
+        weather = normalize_weather_row(
+            wx_row
+        )
+
+        # ----------------------------------------------------------
+        # 4.1. REINICIO DE ACUMULADORES HORARIOS
+        # ----------------------------------------------------------
+
         for state in states.values():
+
             state["condensate_hour_kg"] = 0.0
+
             state["_hour_base"] = {
                 "dehumidified_kg": state["dehumidified_kg"],
                 "dehumidifier_kwh": state["dehumidifier_kwh"],
@@ -1964,29 +2953,43 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
                 "heater_minutes": state["heater_minutes"]
             }
 
+        # Acumuladores de las variables horarias.
         hour_data = {}
 
         for name in states:
+
             hour_data[name] = {
                 "ua": 0.0,
                 "solar_w": 0.0,
-                "people": 0
+                "people": 0,
+
+                "temperature_sum": 0.0,
+                "humidity_ratio_sum": 0.0,
+
+                "samples": 0
             }
 
-        # -----------------------------------------------------------
-        # SUBPASOS
-        # -----------------------------------------------------------
+        # ----------------------------------------------------------
+        # 4.2. SUBPASOS DE CINCO MINUTOS
+        # ----------------------------------------------------------
 
         for step in range(steps_per_hour):
 
-            # El caudal de ventanas de esta hora tiene que existir
-            # antes del intercambio entre estancias.
-            for room in selected_rooms:
+            # A. Caudales de las ventanas.
+            #
+            # Se calculan antes del intercambio entre estancias.
+            for room in rooms_cfg:
+
                 states[room["name"]]["_window_airflow"] = (
-                    window_airflow(room, weather)
+                    window_airflow(
+                        room,
+                        weather
+                    )
                 )
 
-            # 1. Intercambio de aire entre estancias.
+            # B. Intercambio entre estancias.
+            #
+            # Se utilizan todos los estados simultáneamente.
             exchange_air_between_rooms(
                 states,
                 connections,
@@ -1995,8 +2998,9 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
                 dt_s
             )
 
-            # 2. Evolución individual de cada estancia.
-            for room in selected_rooms:
+            # C. Evolución individual de cada estancia.
+            for room in rooms_cfg:
+
                 name = room["name"]
 
                 data = simulate_room_substep(
@@ -2009,20 +3013,46 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
                     dt_s
                 )
 
-                hour_data[name]["ua"] += data["ua"]
-                hour_data[name]["solar_w"] += data["solar_w"]
-                hour_data[name]["people"] = data["people"]
+                # Acumulación de conductancia y ganancias solares.
+                hour_data[name]["ua"] += (
+                    data["ua"]
+                )
 
-        # -----------------------------------------------------------
-        # RESULTADOS AL FINAL DE LA HORA
-        # -----------------------------------------------------------
+                hour_data[name]["solar_w"] += (
+                    data["solar_w"]
+                )
 
-        for room in selected_rooms:
+                hour_data[name]["people"] = (
+                    data["people"]
+                )
+
+                # Acumulación de los estados al final de cada subpaso.
+                # Se utilizará para obtener las medias horarias.
+                hour_data[name]["temperature_sum"] += (
+                    states[name]["temperature"]
+                )
+
+                hour_data[name]["humidity_ratio_sum"] += (
+                    states[name]["w"]
+                )
+
+                hour_data[name]["samples"] += 1
+
+        # ----------------------------------------------------------
+        # 4.3. RESULTADOS HORARIOS DE CADA ESTANCIA
+        # ----------------------------------------------------------
+
+        for room in rooms_cfg:
+
             name = room["name"]
 
-            # Se utiliza el valor medio de UA durante la hora.
-            hour_data[name]["ua"] /= steps_per_hour
-            hour_data[name]["solar_w"] /= steps_per_hour
+            hour_data[name]["ua"] /= (
+                steps_per_hour
+            )
+
+            hour_data[name]["solar_w"] /= (
+                steps_per_hour
+            )
 
             result = room_hour_result(
                 room,
@@ -2034,61 +3064,87 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
                 hour_data[name]
             )
 
-            results_by_room[name].append(result)
+            results_by_room[name].append(
+                result
+            )
 
-    # ---------------------------------------------------------------
-    # RESULTADO GLOBAL
-    # ---------------------------------------------------------------
-
-    total_volume = sum(
-        state["volume"] for state in states.values()
-    )
-
-    total_capacity = sum(
-        state["capacity"] for state in states.values()
-    )
-
-    total_ua = sum(
-        state["ua_envelope"] for state in states.values()
-    )
+    # --------------------------------------------------------------
+    # 5. RESUMEN DE CADA ESTANCIA
+    # --------------------------------------------------------------
 
     room_summary = {}
 
-    for name, rows in results_by_room.items():
+    for room in rooms_cfg:
+
+        name = room["name"]
+
+        rows = results_by_room[name]
+
         if not rows:
             continue
+
         last = rows[-1]
+
+        mean_ua = (
+            sum(
+                row["ua"]
+                for row in rows
+            ) / len(rows)
+        )
+
         room_summary[name] = {
             "tin": last["tin"],
             "rh": last["rh"],
+            "w_g_kg": last["w_g_kg"],
+            "wet_bulb_c": last["wet_bulb_c"],
+
             "condensate_kg": sum(
-                row.get("condensate_kg", 0.0) for row in rows
-            )
+                row.get("condensate_kg", 0.0)
+                for row in rows
+            ),
+
+            "volume": states[name]["volume"],
+            "capacity": states[name]["capacity"],
+            "ua": mean_ua
         }
 
-    if selected_room is not None:
-        name = selected_rooms[0]["name"]
+    # --------------------------------------------------------------
+    # 6. MAGNITUDES GLOBALES
+    # --------------------------------------------------------------
 
-        return {
-            "room": room_label,
-            "results": results_by_room[name],
-            "rooms": results_by_room,
-            "room_results": room_summary,
-            "ua": total_ua,
-            "volume": total_volume,
-            "capacity": total_capacity
-        }
+    total_volume = sum(
+        state["volume"]
+        for state in states.values()
+    )
 
-    # Resultados agregados de vivienda:
-    # se ponderan temperatura y humedad por la masa de aire seco
-    # de cada estancia al final de esa hora.
+    total_capacity = sum(
+        state["capacity"]
+        for state in states.values()
+    )
+
+    total_ua = sum(
+        room_summary[name]["ua"]
+        for name in room_summary
+    )
+
+    # --------------------------------------------------------------
+    # 7. RESULTADOS GLOBALES HORARIOS
+    # --------------------------------------------------------------
+
     global_results = []
 
-    for index in range(int(hours)):
+    for index in range(hours):
+
         total_dry_mass = 0.0
+
+        # Estados finales.
         weighted_temperature = 0.0
         weighted_w = 0.0
         weighted_surface = 0.0
+
+        # Medias temporales horarias.
+        weighted_temperature_avg = 0.0
+        weighted_w_avg = 0.0
 
         room_rows = [
             results_by_room[name][index]
@@ -2096,63 +3152,268 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
         ]
 
         for result in room_rows:
-            mass = float(result.get("dry_air_kg", 0.0))
-            total_dry_mass += mass
-            weighted_temperature += result["tin"] * mass
-            weighted_w += result["w_g_kg"] / 1000.0 * mass
-            weighted_surface += result.get("surface", result["tin"]) * mass
 
-        mean_t = weighted_temperature / max(0.01, total_dry_mass)
-        mean_w = weighted_w / max(0.01, total_dry_mass)
-        mean_surface = weighted_surface / max(0.01, total_dry_mass)
+            mass = max(
+                0.01,
+                float(result.get("dry_air_kg", 0.0))
+            )
+
+            total_dry_mass += mass
+
+            weighted_temperature += (
+                result["tin"] * mass
+            )
+
+            weighted_w += (
+                result["w_g_kg"] / 1000.0 * mass
+            )
+
+            weighted_surface += (
+                result.get("surface", result["tin"])
+                * mass
+            )
+
+            weighted_temperature_avg += (
+                result["tin_avg"] * mass
+            )
+
+            weighted_w_avg += (
+                result["w_g_kg_avg"] / 1000.0 * mass
+            )
+
+        mean_t = (
+            weighted_temperature
+            / max(0.01, total_dry_mass)
+        )
+
+        mean_w = (
+            weighted_w
+            / max(0.01, total_dry_mass)
+        )
+
+        mean_surface = (
+            weighted_surface
+            / max(0.01, total_dry_mass)
+        )
+
+        mean_t_avg = (
+            weighted_temperature_avg
+            / max(0.01, total_dry_mass)
+        )
+
+        mean_w_avg = (
+            weighted_w_avg
+            / max(0.01, total_dry_mass)
+        )
 
         mean_rh = psych.relative_humidity(
-            mean_t, mean_w, config["pressure_pa"]
+            mean_t,
+            mean_w,
+            config["pressure_pa"]
+        )
+
+        mean_rh_avg = psych.relative_humidity(
+            mean_t_avg,
+            mean_w_avg,
+            config["pressure_pa"]
         )
 
         mean_dew = psych.dew_point(
-            mean_t, mean_w, config["pressure_pa"]
+            mean_t,
+            mean_w,
+            config["pressure_pa"]
         )
 
-        def _sum_key(key):
-            return sum(row.get(key, 0.0) for row in room_rows)
+        mean_wet_bulb = wet_bulb_temperature_c(
+            psych,
+            mean_t_avg,
+            mean_w_avg,
+            config["pressure_pa"]
+        )
+
+        def sum_key(key):
+            return sum(
+                row.get(key, 0.0)
+                for row in room_rows
+            )
 
         global_results.append({
+
             "hour": index,
+
+            # Estado final global.
             "tin": mean_t,
             "rh": mean_rh,
             "w_g_kg": mean_w * 1000.0,
+
+            # Medias horarias globales.
+            "tin_avg": mean_t_avg,
+            "rh_avg": mean_rh_avg,
+            "w_g_kg_avg": mean_w_avg * 1000.0,
+
+            # Indicador higrotérmico.
+            "wet_bulb_c": mean_wet_bulb,
+            "hygrothermal_index_c": mean_wet_bulb,
+
             "dew": mean_dew,
             "surface": mean_surface,
+
             "condensation": any(
-                row.get("condensation", False) for row in room_rows
+                row.get("condensation", False)
+                for row in room_rows
             ),
+
             "tout": room_rows[0]["tout"],
             "rhout": room_rows[0]["rhout"],
             "solar": room_rows[0]["solar"],
-            "condensate_kg": _sum_key("condensate_kg"),
-            "dehum_kg": _sum_key("dehum_kg"),
-            "dehum_kwh": _sum_key("dehum_kwh"),
-            "heater_kwh": _sum_key("heater_kwh"),
-            "heater_kwh_th": _sum_key("heater_kwh_th"),
-            "heater_butane_kg": _sum_key("heater_butane_kg"),
-            "ventilation_m3": _sum_key("ventilation_m3"),
-            "vent_min": _sum_key("vent_min"),
-            "dehum_min": _sum_key("dehum_min"),
-            "heat_min": _sum_key("heat_min")
+
+            # Magnitudes agregadas de las estancias.
+            "solar_w": sum_key("solar_w"),
+            "ua": sum_key("ua"),
+
+            "condensate_kg": sum_key("condensate_kg"),
+
+            "dehum_kg": sum_key("dehum_kg"),
+            "dehum_kwh": sum_key("dehum_kwh"),
+
+            "heater_kwh": sum_key("heater_kwh"),
+            "heater_kwh_th": sum_key("heater_kwh_th"),
+            "heater_butane_kg": sum_key("heater_butane_kg"),
+
+            "ventilation_m3": sum_key("ventilation_m3"),
+            "vent_min": sum_key("vent_min"),
+
+            "dehum_min": sum_key("dehum_min"),
+            "heat_min": sum_key("heat_min")
         })
 
-    return {
-        "room": room_label,
+    # --------------------------------------------------------------
+    # 8. RESULTADO COMPLETO
+    # --------------------------------------------------------------
+
+    full_result = {
+        "room": "TODA LA VIVIENDA",
+
         "results": global_results,
+        "global_results": global_results,
+
         "rooms": results_by_room,
         "room_results": room_summary,
+
+        "room_order": room_names_list,
+
         "ua": total_ua,
         "volume": total_volume,
         "capacity": total_capacity
     }
 
+    # La selección se aplica exclusivamente a la vista de resultados.
+    return select_simulation_view(
+        full_result,
+        selected_room
+    )
 
+def select_simulation_view(simulation_result, selected_room=None):
+    """
+    Genera una vista de resultados a partir de una simulación completa.
+
+    No ejecuta cálculos físicos ni modifica los resultados almacenados.
+
+    selected_room:
+        None -> vista global.
+        int  -> índice de la estancia.
+        str  -> nombre de la estancia.
+    """
+
+    view = dict(simulation_result)
+
+    if (
+        selected_room is None
+        or selected_room == "TODA LA VIVIENDA"
+    ):
+
+        view["room"] = "TODA LA VIVIENDA"
+
+        view["results"] = (
+            simulation_result["global_results"]
+        )
+
+        view["selected_room"] = None
+
+        return view
+
+    room_order = simulation_result["room_order"]
+
+    if isinstance(selected_room, int):
+
+        if not 0 <= selected_room < len(room_order):
+            raise ValueError(
+                "Índice de estancia no válido."
+            )
+
+        room_name = room_order[selected_room]
+
+    elif isinstance(selected_room, str):
+
+        room_name = selected_room
+
+        if room_name not in simulation_result["rooms"]:
+            raise ValueError(
+                "La estancia seleccionada no existe."
+            )
+
+    else:
+
+        raise ValueError(
+            "Selección de estancia no válida."
+        )
+
+    view["room"] = room_name
+
+    view["results"] = (
+        simulation_result["rooms"][room_name]
+    )
+
+    view["selected_room"] = room_name
+
+    room_summary = (
+        simulation_result["room_results"][room_name]
+    )
+
+    view["ua"] = room_summary["ua"]
+    view["volume"] = room_summary["volume"]
+    view["capacity"] = room_summary["capacity"]
+
+    return view
+    
+def simulation_signature(config, hours=24, substep_minutes=5):
+    """
+    Genera una huella determinista de la configuración de simulación.
+
+    La huella cambia cuando cambia cualquier dato del JSON,
+    el número de horas o el intervalo de integración.
+
+    No incluye la selección de estancia: cambiar la vista no
+    invalida los resultados calculados.
+    """
+
+    payload = {
+        "config": config,
+        "hours": int(hours),
+        "substep_minutes": float(substep_minutes)
+    }
+
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+    return hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest()
+    
 # ---------------------------------------------------------------------------
 # CONFIGURACION Y VALIDACION
 # ---------------------------------------------------------------------------
@@ -2161,26 +3422,76 @@ def _ensure_room_defaults(rooms):
     """
     Completa los parámetros predeterminados de las estancias.
 
-    Mantiene la compatibilidad con configuraciones JSON anteriores.
+    La disponibilidad de los equipos se establece en False cuando
+    no está especificada expresamente en el JSON.
+
+    Los valores explícitos existentes se conservan.
     """
 
     for room in rooms:
 
-        room.setdefault("windows_open", False)
-        room.setdefault("window_opening_area_m2", 0.0)
-        room.setdefault("window_airflow_m3_h", None)
-        room.setdefault("wind_factor", 0.60)
-        room.setdefault("window_discharge_coefficient", 0.60)
+        room.setdefault(
+            "windows_open",
+            False
+        )
 
-        room.setdefault("internal_gain_w", 0.0)
+        room.setdefault(
+            "window_opening_area_m2",
+            0.0
+        )
 
-        room.setdefault("dehumidifier_l_day", 12.0)
-        room.setdefault("dehumidifier_power_kw", 0.22)
-        room.setdefault("dehumidifier_enabled", True)
+        room.setdefault(
+            "window_airflow_m3_h",
+            None
+        )
 
-        room.setdefault("heater_kw", 3.8)
-        room.setdefault("heating_type", "butane")
-        room.setdefault("heater_enabled", True)
+        room.setdefault(
+            "wind_factor",
+            0.60
+        )
+
+        room.setdefault(
+            "window_discharge_coefficient",
+            0.60
+        )
+
+        # La ausencia de equipo no equivale a equipo instalado.
+        room.setdefault(
+            "heater_enabled",
+            False
+        )
+
+        room.setdefault(
+            "dehumidifier_enabled",
+            False
+        )
+
+        # Valores técnicos de referencia.
+        # Solo se utilizan si el equipo correspondiente está habilitado.
+        room.setdefault(
+            "heater_kw",
+            0.0
+        )
+
+        room.setdefault(
+            "dehumidifier_l_day",
+            0.0
+        )
+
+        room.setdefault(
+            "dehumidifier_power_kw",
+            0.0
+        )
+
+        room.setdefault(
+            "heating_type",
+            "butane"
+        )
+
+        room.setdefault(
+            "window_groups",
+            []
+        )
         
 def load_config(path=CONFIG_FILE):
     if os.path.isfile(path):
