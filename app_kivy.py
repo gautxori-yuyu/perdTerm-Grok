@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Interfaz Kivy para el simulador higrotérmico de vivienda.
-Requiere que 'engine.py' esté en el mismo directorio.
-
-Uso:
-    python app_kivy.py
-
-En pyDroid: abre este fichero y ejecútalo. Matplotlib es opcional.
+Requiere 'engine.py' (extraído de perdidasTermicas2_modGPT3.py) en el mismo directorio.
 """
 
-import os
-import json
 import copy
+from datetime import date
 
-# --- Kivy ---
 from kivy.config import Config
 Config.set('kivy', 'keyboard_mode', 'systemanddock')
 Config.set('kivy', 'exit_on_escape', '0')
@@ -33,9 +26,7 @@ from kivy.uix.popup import Popup
 from kivy.metrics import dp, sp
 from kivy.clock import Clock
 
-# --- Motor ---
 import engine
-DEFAULT_CONFIG = engine.DEFAULT_CONFIG
 load_config = engine.load_config
 save_config = engine.save_config
 validate_config = engine.validate_config
@@ -65,7 +56,26 @@ except Exception:
     pass
 
 
-# ---------------------------------------------------------------- helpers
+# ------------------------------------------------------------------ helpers
+
+GLOBAL_DEFAULTS = {
+    "latitude_deg": 42.5,
+    "longitude_deg": -8.0,
+    "altitude_m": 0.0,
+    "solar_date": None,
+    "solar_utc_offset_hours": None,
+    "solar_glazing_area_factor": 0.90,
+    "solar_ground_reflectance": 0.20,
+    "solar_shading_factor": 1.0,
+    "solar_hour_reference": "interval_end",
+}
+
+ROOM_DEFAULTS = {
+    "heater_enabled": False,
+    "dehumidifier_enabled": False,
+    "window_groups": [],
+}
+
 
 def show_popup(title, message):
     content = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(8))
@@ -81,7 +91,6 @@ def show_popup(title, message):
 
 
 def prompt_filename(default, callback):
-    """Diálogo simple de nombre de fichero (Android-friendly)."""
     content = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(8))
     ti = TextInput(text=default, multiline=False,
                    size_hint_y=None, height=dp(44))
@@ -142,8 +151,9 @@ def read_float(text, default=0.0):
         return default
 
 
-# ---------------------------------------------------------------- specs
+# ------------------------------------------------------------------- specs
 
+# Campos numéricos/texto de la estancia (se renderizan como TextInput).
 ROOM_FIELDS = [
     ("name", "Nombre", "text"),
     ("height", "Altura (m)", "num"),
@@ -173,8 +183,34 @@ ROOM_FALLBACK_KEYS = {"dehumidifier_l_day", "dehumidifier_power_kw",
 
 HEATING_TYPES = ("", "butane", "electric", "heat_pump")
 
+SIM_FIELDS = [
+    ("initial_temperature", "Temperatura inicial (°C)"),
+    ("initial_rh", "HR inicial (%)"),
+    ("target_temperature", "Temperatura objetivo (°C)"),
+    ("target_rh", "HR objetivo (%)"),
+    ("occupancy_start", "Hora inicio ocupación"),
+    ("occupancy_end", "Hora fin ocupación"),
+    ("moisture_per_person_g_h", "Humedad por persona (g/h)"),
+    ("sensible_gain_per_person_w", "Ganancia sensible/persona (W)"),
+    ("ventilation_max_ach", "ACH ventilación máxima"),
+    ("surface_factor", "Factor superficie (fRsi)"),
+    ("heat_pump_cop", "COP bomba de calor"),
+    ("dehumidifier_heat_factor", "Factor térmico deshumidificador"),
+    ("solar_factor", "Factor solar (si no hay grupos)"),
+    ("combustion_moisture_g_kwh", "Humedad combustión (g/kWh)"),
+    # --- Geometría solar ---
+    ("latitude_deg", "Latitud (°)"),
+    ("longitude_deg", "Longitud (°)"),
+    ("altitude_m", "Altitud (m)"),
+    ("solar_glazing_area_factor", "Factor área acristalada"),
+    ("solar_ground_reflectance", "Reflectancia del suelo"),
+    ("solar_shading_factor", "Factor de sombreado global"),
+]
 
-# ---------------------------------------------------------------- app
+SIM_TEXT_FIELDS = [
+    ("solar_date", "Fecha solar (YYYY-MM-DD)"),
+]
+
 
 class SimulatorApp(App):
 
@@ -188,7 +224,6 @@ class SimulatorApp(App):
         self.cfg = self._load_cfg_safe()
         self.last_simulation = None
         self.current_room_index = 0
-        self.current_hour_index = 0
 
         root = BoxLayout(orientation='vertical')
 
@@ -215,28 +250,33 @@ class SimulatorApp(App):
 
         self._go_to('sim')
         Clock.schedule_once(lambda dt: self._load_room_form(), 0.1)
-        Clock.schedule_once(lambda dt: self._load_weather_form(), 0.1)
         return root
 
     def _load_cfg_safe(self):
         cfg = load_config()
         cfg.setdefault("connections", [])
+        for key, default in GLOBAL_DEFAULTS.items():
+            if key not in cfg or cfg[key] is None:
+                if key == "solar_date" and cfg.get(key) is None:
+                    cfg[key] = date.today().isoformat()
+                else:
+                    cfg.setdefault(key, default)
         for room in cfg.get("rooms", []):
-            for key, default in [
-                ("internal_gain_w", 0.0),
-                ("dehumidifier_l_day", None),
-                ("dehumidifier_power_kw", None),
-                ("heater_kw", None),
-                ("heating_type", ""),
-                ("windows_open", False),
-                ("window_opening_area_m2", 0.0),
-                ("window_airflow_m3_h", None),
-                ("wind_factor", 0.60),
-                ("window_discharge_coefficient", 0.60),
-            ]:
-                if key not in room:
-                    room[key] = default
+            for key, default in ROOM_DEFAULTS.items():
+                room.setdefault(key, default if not isinstance(default, list) else list(default))
         return cfg
+
+    def _normalise_cfg(self):
+        self.cfg.setdefault("connections", [])
+        for key, default in GLOBAL_DEFAULTS.items():
+            if key == "solar_date" and self.cfg.get(key) is None:
+                self.cfg[key] = date.today().isoformat()
+            else:
+                self.cfg.setdefault(key, default)
+        for room in self.cfg.get("rooms", []):
+            for key, default in ROOM_DEFAULTS.items():
+                room.setdefault(
+                    key, default if not isinstance(default, list) else list(default))
 
     def _go_to(self, name):
         self.sm.current = name
@@ -261,25 +301,15 @@ class SimulatorApp(App):
         outer.add_widget(scroll)
 
         self.sim_fields = {}
-        sim_spec = [
-            ("initial_temperature", "Temperatura inicial (°C)"),
-            ("initial_rh", "HR inicial (%)"),
-            ("target_temperature", "Temperatura objetivo (°C)"),
-            ("target_rh", "HR objetivo (%)"),
-            ("occupancy_start", "Hora inicio ocupación"),
-            ("occupancy_end", "Hora fin ocupación"),
-            ("moisture_per_person_g_h", "Humedad por persona (g/h)"),
-            ("sensible_gain_per_person_w", "Ganancia sensible/persona (W)"),
-            ("ventilation_max_ach", "ACH ventilación máxima"),
-            ("surface_factor", "Factor superficie (fRsi)"),
-            ("heat_pump_cop", "COP bomba de calor"),
-            ("dehumidifier_heat_factor", "Factor térmico deshumidificador"),
-            ("solar_factor", "Factor solar"),
-            ("combustion_moisture_g_kwh", "Humedad combustión (g/kWh)"),
-        ]
-        for key, label in sim_spec:
+        for key, label in SIM_FIELDS:
             ti = make_text(self.cfg.get(key, ""), numeric=True)
             self.sim_fields[key] = ti
+            self.sim_form.add_widget(make_row(label, ti))
+
+        self.sim_text_fields = {}
+        for key, label in SIM_TEXT_FIELDS:
+            ti = make_text(self.cfg.get(key, ""), numeric=False)
+            self.sim_text_fields[key] = ti
             self.sim_form.add_widget(make_row(label, ti))
 
         self.sim_heating_type = make_spinner(
@@ -337,6 +367,11 @@ class SimulatorApp(App):
     def _collect_sim_fields(self):
         for key, ti in self.sim_fields.items():
             self.cfg[key] = read_float(ti.text, self.cfg.get(key, 0.0))
+        for key, ti in self.sim_text_fields.items():
+            text = ti.text.strip()
+            if key == "solar_date" and not text:
+                text = date.today().isoformat()
+            self.cfg[key] = text
         self.cfg["heating_type"] = self.sim_heating_type.text or "butane"
         self.cfg["ventilation_control"] = bool(self.sim_vent_control.active)
         self.cfg["solar_enabled"] = bool(self.sim_solar_enabled.active)
@@ -346,13 +381,10 @@ class SimulatorApp(App):
             self._collect_sim_fields()
             validate_config(self.cfg)
             choice = self.sim_room_choice.text
-            room_idx = None
+            selected = None
             if choice and choice != "TODA LA VIVIENDA":
-                for i, r in enumerate(self.cfg["rooms"]):
-                    if r.get("name") == choice:
-                        room_idx = i
-                        break
-            self.last_simulation = simulate(self.cfg, room_idx, 24)
+                selected = choice  # el engine acepta nombre o índice
+            self.last_simulation = simulate(self.cfg, selected, 24)
             self._show_results(self.last_simulation)
             self._plot_results(self.last_simulation)
         except Exception as exc:
@@ -364,8 +396,14 @@ class SimulatorApp(App):
             self.results_text.text = "Sin resultados."
             return
         n = len(rows)
-        mean_t = sum(r["tin"] for r in rows) / n
-        mean_rh = sum(r["rh"] for r in rows) / n
+
+        def avg(key):
+            vals = [r.get(key) for r in rows if r.get(key) is not None]
+            return sum(vals) / len(vals) if vals else 0.0
+
+        mean_t = avg("tin_avg") or avg("tin")
+        mean_rh = avg("rh_avg") or avg("rh")
+        mean_wb = avg("wet_bulb_c")
         cond_h = sum(1 for r in rows if r.get("condensation"))
         vent = sum(r.get("vent_min", 0) for r in rows)
         dehum = sum(r.get("dehum_min", 0) for r in rows)
@@ -375,35 +413,42 @@ class SimulatorApp(App):
         heat_th = sum(r.get("heater_kwh_th", 0) for r in rows)
         heat_el = sum(r.get("heater_kwh", 0) for r in rows)
         fuel = sum(r.get("heater_butane_kg", 0) for r in rows)
+
         lines = [
             "RESULTADOS: %s" % sim.get("room", "?"),
             "Volumen %.1f m³ | UA %.1f W/K | C %.2f MJ/K" % (
                 sim.get("volume", 0), sim.get("ua", 0),
                 sim.get("capacity", 0) / 1e6),
-            "T media %.1f °C | HR media %.1f %% | "
-            "Horas cond. %d" % (mean_t, mean_rh, cond_h),
+            "T media %.1f °C | HR media %.1f %% | Tbh media %.1f °C | "
+            "Horas cond. %d" % (mean_t, mean_rh, mean_wb, cond_h),
             "Vent %.0f min | Desh %.0f min (%.2f L) | "
             "Cond %.3f kg" % (vent, dehum, dehum_kg, cond_kg),
             "Cal %.0f min | Eth %.2f kWh | Eel %.2f kWh | "
             "Butano %.3f kg" % (heat, heat_th, heat_el, fuel),
             "",
-            "Hr  Text  Tint   HR  Rocio Superf Vent Desh Cal  Cond",
+            "Hr  Text  Tint   HR  Tbh  Rocio Superf Vent Desh Cal  Cond",
         ]
         for r in rows:
+            t_disp = r.get("tin_avg", r.get("tin", 0))
+            rh_disp = r.get("rh_avg", r.get("rh", 0))
+            wb_disp = r.get("wet_bulb_c", r.get("tin", 0))
             lines.append(
-                "%02d %5.1f %5.1f %5.1f %5.1f %6.1f %3.0f %3.0f %3.0f %.3f" % (
-                    r.get("hour", 0), r.get("tout", 0), r.get("tin", 0),
-                    r.get("rh", 0), r.get("dew", 0), r.get("surface", 0),
+                "%02d %5.1f %5.1f %5.1f %5.1f %5.1f %6.1f %3.0f %3.0f %3.0f %.3f" % (
+                    r.get("hour", 0), r.get("tout", 0), t_disp, rh_disp,
+                    wb_disp, r.get("dew", 0), r.get("surface", 0),
                     r.get("vent_min", 0), r.get("dehum_min", 0),
                     r.get("heat_min", 0), r.get("condensate_kg", 0)))
+
         room_results = sim.get("room_results", {})
         if room_results:
             lines.append("")
             lines.append("POR ESTANCIA:")
             for name, data in room_results.items():
-                lines.append("  %s: T=%.1f °C HR=%.1f %% cond=%.3f kg" % (
-                    name, data.get("tin", 0), data.get("rh", 0),
-                    data.get("condensate_kg", 0)))
+                lines.append(
+                    "  %s: T=%.1f °C HR=%.1f %% Tbh=%.1f °C cond=%.3f kg" % (
+                        name, data.get("tin", 0), data.get("rh", 0),
+                        data.get("wet_bulb_c", 0),
+                        data.get("condensate_kg", 0)))
         self.results_text.text = "\n".join(lines)
 
     def _plot_results(self, sim):
@@ -424,6 +469,10 @@ class SimulatorApp(App):
             ax.plot(x, [r.get("tout", 0) for r in rows], label="Text")
             ax.plot(x, [r.get("dew", 0) for r in rows], label="Rocío")
             ax.plot(x, [r.get("surface", 0) for r in rows], label="Sup")
+            wb = [r.get("wet_bulb_c") for r in rows]
+            if any(v is not None for v in wb):
+                ax.plot(x, [v if v is not None else 0 for v in wb],
+                        label="Tbh", linestyle="--")
             ax.set_xlabel("Hora")
             ax.set_ylabel("°C")
             ax.grid(True)
@@ -467,27 +516,11 @@ class SimulatorApp(App):
                 show_popup("Error", str(exc))
         prompt_filename(CONFIG_FILE, do_load)
 
-    def _normalise_cfg(self):
-        self.cfg.setdefault("connections", [])
-        for room in self.cfg.get("rooms", []):
-            for key, default in [
-                ("internal_gain_w", 0.0),
-                ("dehumidifier_l_day", None),
-                ("dehumidifier_power_kw", None),
-                ("heater_kw", None),
-                ("heating_type", ""),
-                ("windows_open", False),
-                ("window_opening_area_m2", 0.0),
-                ("window_airflow_m3_h", None),
-                ("wind_factor", 0.60),
-                ("window_discharge_coefficient", 0.60),
-            ]:
-                if key not in room:
-                    room[key] = default
-
     def _reload_all_fields(self):
         for key, ti in self.sim_fields.items():
             ti.text = str(self.cfg.get(key, ""))
+        for key, ti in self.sim_text_fields.items():
+            ti.text = str(self.cfg.get(key, "") or "")
         self.sim_heating_type.text = self.cfg.get("heating_type", "butane")
         self.sim_vent_control.active = bool(
             self.cfg.get("ventilation_control", True))
@@ -499,11 +532,9 @@ class SimulatorApp(App):
         if self.sim_room_choice.text not in room_names:
             self.sim_room_choice.text = "TODA LA VIVIENDA"
         self.current_room_index = 0
-        self.current_hour_index = 0
         self._load_room_form()
-        self._load_weather_form()
+        self._refresh_weather_table()
         self._refresh_connections_list()
-
 
     def _export_csv(self):
         if not self.last_simulation:
@@ -559,6 +590,23 @@ class SimulatorApp(App):
             self.room_inputs[key] = ti
             self.room_form.add_widget(make_row(label, ti))
 
+        # Interruptores de disponibilidad de equipos.
+        eq_frame = BoxLayout(orientation='vertical', size_hint_y=None,
+                              height=dp(108), spacing=dp(2))
+        row1 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        row1.add_widget(Label(text="Calefacción disponible",
+                              size_hint_x=0.7))
+        self.room_heater_enabled = Switch(active=False)
+        row1.add_widget(self.room_heater_enabled)
+        eq_frame.add_widget(row1)
+        row2 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        row2.add_widget(Label(text="Deshumidificador disponible",
+                              size_hint_x=0.7))
+        self.room_dehumidifier_enabled = Switch(active=False)
+        row2.add_widget(self.room_dehumidifier_enabled)
+        eq_frame.add_widget(row2)
+        self.room_form.add_widget(eq_frame)
+
         self.room_heating_type = make_spinner(HEATING_TYPES, "")
         self.room_form.add_widget(make_row(
             "Tipo calefacción (vacío = global)", self.room_heating_type))
@@ -606,6 +654,10 @@ class SimulatorApp(App):
         for key, ti in self.room_inputs.items():
             value = room.get(key, "")
             ti.text = "" if value is None else str(value)
+        self.room_heater_enabled.active = bool(
+            room.get("heater_enabled", False))
+        self.room_dehumidifier_enabled.active = bool(
+            room.get("dehumidifier_enabled", False))
         self.room_heating_type.text = room.get("heating_type", "") or ""
         self.room_windows_open.active = bool(room.get("windows_open", False))
         manual = room.get("window_airflow_m3_h")
@@ -624,15 +676,20 @@ class SimulatorApp(App):
             elif key == "people":
                 data[key] = int(read_float(text, 0))
             elif key in ROOM_FALLBACK_KEYS:
+                # None = usar el valor global
                 data[key] = None if text == "" else read_float(text, 0.0)
             else:
                 data[key] = read_float(text, 0.0)
+        data["heater_enabled"] = bool(self.room_heater_enabled.active)
+        data["dehumidifier_enabled"] = bool(self.room_dehumidifier_enabled.active)
         ht = self.room_heating_type.text.strip()
         data["heating_type"] = ht if ht else None
         data["windows_open"] = bool(self.room_windows_open.active)
         manual = self.room_manual_flow.text.strip()
         data["window_airflow_m3_h"] = (
             None if manual == "" else read_float(manual, 0.0))
+        data["window_groups"] = list(
+            self._current_room().get("window_groups", []) or [])
 
         for i, other in enumerate(self.cfg.get("rooms", [])):
             if i == self.current_room_index:
@@ -692,17 +749,21 @@ class SimulatorApp(App):
             "wall_area": 20.0, "wall_u": 1.1,
             "roof_area": 0.0, "roof_u": 0.85,
             "floor_exposed_area": 0.0, "floor_u": 1.6,
-            "air_changes_h": 0.35,
+            "air_changes_h": self.cfg.get("air_changes_h", 0.35),
             "thermal_mass_j_m2k": self.cfg.get(
                 "thermal_mass_j_m2k", 100000.0),
             "people": 0, "internal_gain_w": 0.0,
-            "dehumidifier_l_day": None,
-            "dehumidifier_power_kw": None,
-            "heater_kw": None,
+            # Equipos: sin habilitar por defecto
+            "heater_enabled": False,
+            "heater_kw": 0.0,
             "heating_type": None,
+            "dehumidifier_enabled": False,
+            "dehumidifier_l_day": 0.0,
+            "dehumidifier_power_kw": 0.0,
             "windows_open": False,
             "window_opening_area_m2": 0.0,
             "window_airflow_m3_h": None,
+            "window_groups": [],
             "wind_factor": 0.60,
             "window_discharge_coefficient": 0.60,
         }
@@ -712,7 +773,6 @@ class SimulatorApp(App):
         names = ["TODA LA VIVIENDA"] + [
             r.get("name", "") for r in self.cfg.get("rooms", [])]
         self.sim_room_choice.values = names
-
 
     def _delete_room(self):
         if len(self.cfg.get("rooms", [])) <= 1:
@@ -814,17 +874,14 @@ class SimulatorApp(App):
         room_a = Spinner(text=original.get("room_a", room_names[0]),
                           values=room_names, size_hint_y=None, height=dp(44))
         form.add_widget(make_row("Estancia A", room_a))
-
         room_b = Spinner(text=original.get("room_b", room_names[1]),
                           values=room_names, size_hint_y=None, height=dp(44))
         form.add_widget(make_row("Estancia B", room_b))
-
         type_w = Spinner(
             text=original.get("type", "open"),
             values=("open", "ajar", "closed_gap", "custom"),
             size_hint_y=None, height=dp(44))
         form.add_widget(make_row("Tipo", type_w))
-
         airflow_ti = make_text(
             original.get("airflow_m3_h",
                           original.get("flow_m3_h", "")) or "",
@@ -876,94 +933,96 @@ class SimulatorApp(App):
         except Exception:
             pass
 
-    # ================================================= WEATHER
+    # ================================================= WEATHER (tabla)
 
     def _build_weather_screen(self):
         screen = Screen(name='weather')
         outer = BoxLayout(orientation='vertical', padding=dp(4), spacing=dp(4))
         screen.add_widget(outer)
 
-        nav = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(4))
-        prev = Button(text="◀ Hora", size_hint_x=0.3)
-        prev.bind(on_release=lambda *a: self._nav_hour(-1))
-        nav.add_widget(prev)
-        self.hour_label = Label(text="", size_hint_x=0.4, font_size=sp(13))
-        nav.add_widget(self.hour_label)
-        nxt = Button(text="Hora ▶", size_hint_x=0.3)
-        nxt.bind(on_release=lambda *a: self._nav_hour(1))
-        nav.add_widget(nxt)
-        outer.add_widget(nav)
-
         scroll = ScrollView(size_hint_y=1)
-        form = BoxLayout(orientation='vertical', size_hint_y=None,
-                          spacing=dp(2), padding=dp(4))
-        form.bind(minimum_height=form.setter('height'))
-        scroll.add_widget(form)
+        self.weather_table = GridLayout(cols=6, size_hint_y=None,
+                                          spacing=dp(1), padding=dp(2))
+        self.weather_table.bind(
+            minimum_height=self.weather_table.setter('height'))
+        scroll.add_widget(self.weather_table)
         outer.add_widget(scroll)
 
-        self.weather_inputs = {}
-        for key, label in [
-            ("temperature", "Temperatura exterior (°C)"),
-            ("rh", "HR exterior (%)"),
-            ("solar", "Radiación solar (W/m²)"),
-            ("wind", "Velocidad viento (m/s)"),
-            ("direction", "Dirección viento (°)"),
-        ]:
-            ti = make_text("", numeric=True)
-            self.weather_inputs[key] = ti
-            form.add_widget(make_row(label, ti))
-
-        save = Button(text="Guardar hora", size_hint_y=None, height=dp(48))
-        save.bind(on_release=lambda *a: self._save_hour(verbose=True))
-        outer.add_widget(save)
-
+        self._refresh_weather_table()
         return screen
 
-    def _load_weather_form(self):
+    def _refresh_weather_table(self):
+        self.weather_table.clear_widgets()
+        for h in ["Hora", "Text", "HR", "Solar", "Viento", "Dir"]:
+            self.weather_table.add_widget(Label(
+                text=h, bold=True, font_size=sp(11),
+                size_hint_y=None, height=dp(32)))
+        for idx, row in enumerate(self.cfg.get("weather", [])):
+            btn = Button(text=str(row[0]), font_size=sp(11),
+                         size_hint_y=None, height=dp(40))
+            btn.bind(on_release=lambda b, i=idx: self._edit_weather_hour(i))
+            self.weather_table.add_widget(btn)
+            for j in range(1, 6):
+                value = row[j] if j < len(row) else 0
+                self.weather_table.add_widget(Label(
+                    text=str(value), font_size=sp(11),
+                    size_hint_y=None, height=dp(40)))
+
+    def _edit_weather_hour(self, idx):
         weather = self.cfg.get("weather", [])
-        if not weather:
-            self.hour_label.text = "(sin datos)"
+        if not 0 <= idx < len(weather):
             return
-        idx = max(0, min(self.current_hour_index, len(weather) - 1))
         row = weather[idx]
-        self.hour_label.text = "Hora %d/23" % idx
-        self.weather_inputs["temperature"].text = str(row[1])
-        self.weather_inputs["rh"].text = str(row[2])
-        self.weather_inputs["solar"].text = str(row[3])
-        self.weather_inputs["wind"].text = str(row[4] if len(row) > 4 else 0)
-        self.weather_inputs["direction"].text = str(
-            row[5] if len(row) > 5 else 0)
-
-    def _save_hour(self, verbose=False):
-        try:
-            weather = self.cfg.get("weather", [])
-            idx = self.current_hour_index
-            vals = [read_float(self.weather_inputs[k].text, 0.0)
-                    for k in ("temperature", "rh", "solar", "wind",
-                              "direction")]
-            temp, rh, solar, wind, direction = vals
-            if not 0 <= rh <= 100:
-                raise ValueError("HR entre 0 y 100.")
-            if solar < 0 or wind < 0:
-                raise ValueError("Solar y viento deben ser >= 0.")
-            if not 0 <= direction <= 360:
-                raise ValueError("Dirección entre 0 y 360.")
-            weather[idx] = [idx, temp, rh, solar, wind, direction]
-            if verbose:
-                show_popup("Meteo", "Hora %d actualizada." % idx)
-            return True
-        except Exception as exc:
-            if verbose:
+        labels = [
+            ("temperature", "Temperatura (°C)"),
+            ("rh", "HR (%)"),
+            ("solar", "Radiación (W/m²)"),
+            ("wind", "Viento (m/s)"),
+            ("direction", "Dirección (°)"),
+        ]
+        values = {
+            "temperature": row[1],
+            "rh": row[2],
+            "solar": row[3],
+            "wind": row[4] if len(row) > 4 else 0,
+            "direction": row[5] if len(row) > 5 else 0,
+        }
+        content = BoxLayout(orientation='vertical', padding=dp(8),
+                              spacing=dp(2))
+        inputs = {}
+        for key, label in labels:
+            ti = make_text(values[key], numeric=True)
+            inputs[key] = ti
+            content.add_widget(make_row(label, ti))
+        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(4))
+        ok = Button(text="Aceptar")
+        cancel = Button(text="Cancelar")
+        btns.add_widget(ok)
+        btns.add_widget(cancel)
+        content.add_widget(btns)
+        popup = Popup(title="Hora %d" % idx, content=content,
+                      size_hint=(0.9, 0.85))
+        def accept(*a):
+            try:
+                temp = read_float(inputs["temperature"].text, 0.0)
+                rh = read_float(inputs["rh"].text, 0.0)
+                solar = read_float(inputs["solar"].text, 0.0)
+                wind = read_float(inputs["wind"].text, 0.0)
+                direction = read_float(inputs["direction"].text, 0.0)
+                if not 0 <= rh <= 100:
+                    raise ValueError("HR entre 0 y 100.")
+                if solar < 0 or wind < 0:
+                    raise ValueError("Solar y viento >= 0.")
+                if not 0 <= direction <= 360:
+                    raise ValueError("Dirección entre 0 y 360.")
+                weather[idx] = [idx, temp, rh, solar, wind, direction]
+                popup.dismiss()
+                self._refresh_weather_table()
+            except Exception as exc:
                 show_popup("Meteo", str(exc))
-            return False
-
-    def _nav_hour(self, delta):
-        self._save_hour(verbose=False)
-        weather = self.cfg.get("weather", [])
-        new_idx = self.current_hour_index + delta
-        if 0 <= new_idx < len(weather):
-            self.current_hour_index = new_idx
-            self._load_weather_form()
+        ok.bind(on_release=accept)
+        cancel.bind(on_release=lambda *a: popup.dismiss())
+        popup.open()
 
 
 if __name__ == "__main__":

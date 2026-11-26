@@ -24,7 +24,9 @@ import math
 import copy
 import calendar
 import hashlib
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -152,15 +154,21 @@ DEFAULT_CONFIG = {
     ],
     "latitude_deg": 42.5,
     "longitude_deg": -8.0,
-    "altitude_m": 0.0,
+    "altitude_m": None,
 
     "solar_date": date.today().isoformat(),
     "solar_utc_offset_hours": None,
 
     "solar_glazing_area_factor": 0.90,
     "solar_ground_reflectance": 0.20,
-    "solar_shading_factor": 1.0
+    "solar_shading_factor": 1.0,
     "solar_hour_reference": "interval_end",
+
+    # Metadatos del perfil meteorológico descargado.
+    "weather_times": [],
+    "weather_timezone": None,
+    "weather_utc_offset_seconds": None,
+    "weather_source": "manual"
 }
 
 # CONEXIONES ENTRE ESTANCIAS
@@ -205,6 +213,138 @@ SOLAR_ORIENTATIONS = {
     "NW": 315.0,
     "W": 270.0,
     "SW": 225.0
+}
+
+THERMAL_MASS_PRESETS = {
+    "Ligera": 30000.0,
+    "Media": 60000.0,
+    "Pesada": 120000.0,
+    "Muy pesada": 200000.0
+}
+
+U_VALUE_PRESETS = {
+    "window_u": {
+        "Vidrio simple + marco convencional": 5.7,
+        "Doble vidrio convencional": 2.7,
+        "Doble vidrio bajo emisivo": 1.6,
+        "Triple vidrio aislante": 0.9
+    },
+
+    "wall_u": {
+        "Mampostería de piedra maciza gruesa": 1.6,
+        "Fábrica de ladrillo sin cámara": 1.8,
+        "Doble hoja con cámara sin aislamiento": 1.3,
+        "Doble hoja con cámara aislada": 0.65,
+        "Muro con aislamiento continuo 8-10 cm": 0.35
+    },
+
+    "roof_u": {
+        "Cubierta sin aislamiento": 1.8,
+        "Cubierta con aislamiento 5 cm": 0.65,
+        "Cubierta con aislamiento 8 cm": 0.45,
+        "Cubierta con aislamiento 12 cm": 0.30
+    },
+
+    "floor_u": {
+        "Suelo sin aislamiento": 1.5,
+        "Suelo con aislamiento 5 cm": 0.55,
+        "Suelo con aislamiento 8 cm": 0.40,
+        "Suelo con aislamiento 10 cm": 0.32
+    }
+}
+
+PARAMETER_TIPS = {
+    "pressure_pa":
+        "Presión absoluta del aire en Pa. Determina las relaciones "
+        "psicrométricas entre temperatura, humedad y presión de vapor.",
+
+    "initial_temperature":
+        "Temperatura seca inicial de la estancia al comenzar la simulación.",
+
+    "initial_rh":
+        "Humedad relativa inicial. Junto con la temperatura inicial "
+        "determina la humedad específica inicial.",
+
+    "target_temperature":
+        "Temperatura de consigna. Activa o limita el funcionamiento "
+        "de la calefacción.",
+
+    "target_rh":
+        "Humedad relativa de consigna a la temperatura objetivo. "
+        "Se transforma en una humedad específica de referencia "
+        "que permanece constante durante la simulación.",
+
+    "thermal_mass_j_m2k":
+        "Inercia térmica de la estancia. Capacidad térmica efectiva "
+        "de la masa constructiva acoplada al aire por m² de suelo. "
+        "Cuanto mayor es, más energía se necesita para cambiar la temperatura.",
+
+    "internal_gain_w":
+        "Aporte térmico medio de equipos y aparatos. Potencia térmica "
+        "sensible que aportan aparatos, iluminación y otras fuentes "
+        "internas no modelizadas individualmente.",
+
+    "moisture_per_person_g_h":
+        "Generación de vapor de agua por persona y hora, expresada en g/h.",
+
+    "sensible_gain_per_person_w":
+        "Potencia térmica sensible aportada por cada persona presente.",
+
+    "air_changes_h":
+        "Renovaciones de aire por hora permanentes de la estancia. "
+        "Representa infiltración o ventilación base, no la apertura "
+        "controlada de ventanas.",
+
+    "ventilation_max_ach":
+        "Límite máximo de renovaciones totales por hora, incluyendo "
+        "la ventilación base. El caudal adicional también está limitado "
+        "por la apertura de las ventanas.",
+
+    "dehumidifier_l_day":
+        "Capacidad nominal de extracción de agua del deshumidificador, "
+        "expresada en litros por día. La capacidad efectiva depende "
+        "de la temperatura y la humedad del aire.",
+
+    "dehumidifier_power_kw":
+        "Potencia eléctrica nominal del deshumidificador en kW.",
+
+    "dehumidifier_heat_factor":
+        "Factor aplicado a la aportación térmica asociada al consumo "
+        "eléctrico del deshumidificador. El calor latente recuperado "
+        "por la condensación se contabiliza separadamente.",
+
+    "heater_kw":
+        "Potencia térmica suministrada cuando la calefacción está "
+        "encendida. No es una potencia modulada por el simulador.",
+
+    "solar_factor":
+        "Factor solar g del acristalamiento. Representa la fracción "
+        "de radiación solar que acaba entrando en el recinto.",
+
+    "solar_glazing_area_factor":
+        "Coeficiente para transformar la superficie total del hueco "
+        "en una superficie acristalada efectiva. Un valor 0,90 "
+        "supone un 10 % de superficie ocupada por marco.",
+
+    "solar_shading_factor":
+        "Factor de reducción solar por persianas, cortinas, aleros, "
+        "vegetación u obstáculos. 1 significa sin reducción; "
+        "0,5 significa que solo se considera el 50 % de la ganancia.",
+
+    "solar_ground_reflectance":
+        "Reflectancia solar del terreno. 0,20 representa un suelo "
+        "de reflectancia moderada.",
+
+    "latitude_deg":
+        "Latitud geográfica decimal. Positiva al norte del ecuador.",
+
+    "longitude_deg":
+        "Longitud geográfica decimal. Positiva al este de Greenwich "
+        "y negativa al oeste.",
+
+    "altitude_m":
+        "Altitud de la vivienda sobre el nivel del mar, en metros. "
+        "Puede dejarse vacía para utilizar la elevación del modelo meteorológico."
 }
 
 # ---------------------------------------------------------------------------
@@ -424,7 +564,204 @@ def room_window_area_total(room):
         float(room.get("window_area", 0.0))
     )
     
+def fetch_open_meteo_weather(config, forecast_hours=24):
+    """
+    Descarga un perfil meteorológico horario de Open-Meteo.
 
+    Utiliza las coordenadas GPS y, opcionalmente, la altitud
+    configuradas para la vivienda.
+
+    Obtiene:
+        - Temperatura exterior.
+        - Humedad relativa exterior.
+        - Radiación global horizontal GHI.
+        - Radiación directa normal DNI.
+        - Radiación difusa horizontal DHI.
+        - Velocidad y dirección del viento.
+
+    Devuelve un diccionario preparado para incorporarse
+    directamente a la configuración JSON.
+
+    El horizonte se inicia en la hora de predicción disponible
+    más próxima y cubre forecast_hours horas.
+    """
+
+    latitude = float(config["latitude_deg"])
+    longitude = float(config["longitude_deg"])
+
+    if not -90.0 <= latitude <= 90.0:
+        raise ValueError(
+            "La latitud debe estar entre -90 y 90 grados."
+        )
+
+    if not -180.0 <= longitude <= 180.0:
+        raise ValueError(
+            "La longitud debe estar entre -180 y 180 grados."
+        )
+
+    forecast_hours = int(forecast_hours)
+
+    if not 1 <= forecast_hours <= 384:
+        raise ValueError(
+            "El horizonte debe estar entre 1 y 384 horas."
+        )
+
+    hourly_variables = (
+        "temperature_2m,"
+        "relative_humidity_2m,"
+        "shortwave_radiation,"
+        "direct_normal_irradiance,"
+        "diffuse_radiation,"
+        "wind_speed_10m,"
+        "wind_direction_10m"
+    )
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": hourly_variables,
+        "forecast_hours": forecast_hours,
+        "timezone": "auto",
+        "wind_speed_unit": "ms",
+        "timeformat": "iso8601"
+    }
+
+    altitude = config.get("altitude_m")
+
+    if altitude is not None and str(altitude).strip():
+        params["elevation"] = float(altitude)
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        + urlencode(params)
+    )
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "perdTerm-Grok/1.0"
+        }
+    )
+
+    try:
+        with urlopen(request, timeout=25) as response:
+            payload = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except Exception as exc:
+        raise RuntimeError(
+            "No se pudo obtener el perfil meteorológico "
+            "de Open-Meteo: %s" % exc
+        )
+
+    if "error" in payload and payload["error"]:
+        raise RuntimeError(
+            payload.get(
+                "reason",
+                "Open-Meteo ha devuelto un error."
+            )
+        )
+
+    hourly = payload.get("hourly", {})
+
+    times = hourly.get("time", [])
+
+    if len(times) < forecast_hours:
+        raise RuntimeError(
+            "Open-Meteo ha devuelto menos horas de las solicitadas."
+        )
+
+    def get_series(key):
+        values = hourly.get(key)
+
+        if values is None:
+            return [None] * len(times)
+
+        return values
+
+    series = {
+        "temperature": get_series("temperature_2m"),
+        "rh": get_series("relative_humidity_2m"),
+        "ghi": get_series("shortwave_radiation"),
+        "dni": get_series("direct_normal_irradiance"),
+        "dhi": get_series("diffuse_radiation"),
+        "wind": get_series("wind_speed_10m"),
+        "direction": get_series("wind_direction_10m")
+    }
+
+    rows = []
+    timestamps = []
+
+    for i in range(forecast_hours):
+
+        timestamp = str(times[i])
+
+        try:
+            dt = datetime.fromisoformat(
+                timestamp
+            )
+        except ValueError:
+            raise RuntimeError(
+                "Fecha meteorológica no válida: %s"
+                % timestamp
+            )
+
+        def numeric(key, default=None):
+            value = series[key][i]
+
+            if value is None:
+                return default
+
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        temperature = numeric("temperature")
+        rh = numeric("rh")
+
+        if temperature is None or rh is None:
+            raise RuntimeError(
+                "Temperatura o humedad exterior no disponibles "
+                "para %s." % timestamp
+            )
+
+        ghi = numeric("ghi", 0.0)
+        wind = numeric("wind", 0.0)
+        direction = numeric("direction", 0.0)
+
+        dni = numeric("dni")
+        dhi = numeric("dhi")
+
+        # Estructura:
+        # [hora local, T, HR, GHI, viento, dirección, DNI, DHI]
+        rows.append([
+            dt.hour,
+            temperature,
+            rh,
+            max(0.0, ghi),
+            max(0.0, wind),
+            direction,
+            None if dni is None else max(0.0, dni),
+            None if dhi is None else max(0.0, dhi)
+        ])
+
+        timestamps.append(timestamp)
+
+    return {
+        "weather": rows,
+        "weather_times": timestamps,
+        "weather_timezone": payload.get("timezone"),
+        "weather_utc_offset_seconds": payload.get(
+            "utc_offset_seconds"
+        ),
+        "weather_source": "Open-Meteo",
+        "weather_fetched_at": datetime.now().isoformat(
+            timespec="seconds"
+        )
+    }
+    
 def last_sunday_of_month(year, month):
     """
     Obtiene la fecha del último domingo de un mes.
@@ -473,77 +810,117 @@ def solar_utc_offset(day, config):
     return 1.0
 
 
-def solar_position(hour, config, day_offset=0):
+def solar_position(hour, config, day_offset=0,
+                   timestamp=None):
     """
-    Calcula la elevación y azimut solar.
+    Calcula la posición solar.
+
+    Prioridad:
+        1. pvlib, algoritmo NREL SPA.
+        2. Aproximación NOAA como alternativa sin dependencias.
 
     Devuelve:
-        elevation_deg: elevación solar sobre el horizonte.
-        azimuth_deg: azimut desde el norte, sentido horario.
-        cos_zenith: coseno del ángulo cenital.
-
-    Utiliza fecha, latitud, longitud y hora local.
+        elevación solar (grados),
+        azimut solar (grados desde el norte, sentido horario),
+        coseno del ángulo cenital.
     """
 
-    solar_date = str(
-        config.get(
-            "solar_date",
-            date.today().isoformat()
-        )
-    )
+    # --------------------------------------------------------------
+    # 1. OBTENCIÓN DE LA FECHA Y HORA
+    # --------------------------------------------------------------
 
-    try:
+    if timestamp:
+
+        try:
+            solar_dt = datetime.fromisoformat(
+                str(timestamp)
+            )
+
+        except ValueError:
+            raise ValueError(
+                "Timestamp solar no válido: %s" % timestamp
+            )
+
+        if solar_dt.tzinfo is None:
+
+            offset_seconds = config.get(
+                "weather_utc_offset_seconds"
+            )
+
+            if offset_seconds is None:
+                offset_hours = solar_utc_offset(
+                    solar_dt.date(),
+                    config
+                )
+                offset_seconds = offset_hours * 3600.0
+
+            tz = timezone(
+                timedelta(seconds=float(offset_seconds))
+            )
+
+            solar_dt = solar_dt.replace(
+                tzinfo=tz
+            )
+
+    else:
+
+        solar_date = str(
+            config.get(
+                "solar_date",
+                date.today().isoformat()
+            )
+        )
+
         base_date = date.fromisoformat(
             solar_date[:10]
         )
-    except ValueError:
-        raise ValueError(
-            "solar_date debe tener formato YYYY-MM-DD."
-        )
-    '''
-    local_hour = float(hour) + 0.5
 
-    current_date = (
-        base_date
-        + timedelta(days=int(day_offset))
-    )
-    '''
-    # La radiación horaria de Open-Meteo corresponde a la hora anterior.
-    # Por ejemplo, el dato etiquetado 13:00 representa 12:00-13:00.
+        current_date = (
+            base_date + timedelta(days=int(day_offset))
+        )
+
+        offset_hours = solar_utc_offset(
+            current_date,
+            config
+        )
+
+        tz = timezone(
+            timedelta(hours=offset_hours)
+        )
+
+        solar_dt = (
+            datetime.combine(
+                current_date,
+                time.min
+            ).replace(tzinfo=tz)
+            + timedelta(hours=float(hour))
+        )
+
+    # La radiación Open-Meteo es un promedio de la hora anterior.
+    # Por tanto, se utiliza su instante central.
     reference = config.get(
         "solar_hour_reference",
         "interval_end"
     )
 
     if reference == "interval_end":
-        local_hour = float(hour) - 0.5
 
-    elif reference == "interval_start":
-        local_hour = float(hour) + 0.5
-
-    elif reference == "instant":
-        local_hour = float(hour)
-
-    else:
-        raise ValueError(
-            "solar_hour_reference debe ser interval_end, "
-            "interval_start o instant."
+        solar_dt -= timedelta(
+            minutes=30
         )
 
-    adjusted_day_offset = int(day_offset)
+    elif reference not in ("instant", "interval_start"):
 
-    while local_hour < 0.0:
-        local_hour += 24.0
-        adjusted_day_offset -= 1
+        raise ValueError(
+            "solar_hour_reference debe ser "
+            "interval_end, interval_start o instant."
+        )
 
-    while local_hour >= 24.0:
-        local_hour -= 24.0
-        adjusted_day_offset += 1
+    elif reference == "interval_start":
 
-    current_date = (
-        base_date
-        + timedelta(days=adjusted_day_offset)
-    )
+        solar_dt += timedelta(
+            minutes=30
+        )
 
     latitude = float(
         config.get("latitude_deg", 42.5)
@@ -553,37 +930,79 @@ def solar_position(hour, config, day_offset=0):
         config.get("longitude_deg", -8.0)
     )
 
-    if not -90.0 <= latitude <= 90.0:
-        raise ValueError(
-            "La latitud debe estar entre -90 y 90 grados."
+    altitude = config.get("altitude_m")
+
+    # --------------------------------------------------------------
+    # 2. PVLIB: NREL SPA
+    # --------------------------------------------------------------
+
+    try:
+        import pandas as pd
+        from pvlib.solarposition import get_solarposition
+
+        times = pd.DatetimeIndex([
+            solar_dt
+        ])
+
+        position = get_solarposition(
+            times,
+            latitude=latitude,
+            longitude=longitude,
+            altitude=(
+                None if altitude is None
+                else float(altitude)
+            ),
+            method="nrel_numpy"
         )
 
-    if not -180.0 <= longitude <= 180.0:
-        raise ValueError(
-            "La longitud debe estar entre -180 y 180 grados."
+        elevation = float(
+            position["elevation"].iloc[0]
         )
 
-    utc_offset = solar_utc_offset(
-        current_date,
-        config
-    )
+        azimuth = float(
+            position["azimuth"].iloc[0]
+        ) % 360.0
 
-    day_of_year = current_date.timetuple().tm_yday
+        cos_zenith = math.sin(
+            math.radians(elevation)
+        )
+
+        return (
+            elevation,
+            azimuth,
+            clamp(cos_zenith, -1.0, 1.0)
+        )
+
+    except Exception:
+        # Si pvlib no está instalado o no puede calcular,
+        # se utiliza la alternativa NOAA.
+        pass
+
+    # --------------------------------------------------------------
+    # 3. ALTERNATIVA NOAA
+    # --------------------------------------------------------------
+
+    day_of_year = solar_dt.timetuple().tm_yday
 
     days_in_year = (
-        366 if calendar.isleap(current_date.year)
+        366 if calendar.isleap(solar_dt.year)
         else 365
+    )
+
+    decimal_hour = (
+        solar_dt.hour
+        + solar_dt.minute / 60.0
+        + solar_dt.second / 3600.0
     )
 
     gamma = (
         2.0 * math.pi / days_in_year
         * (
             day_of_year - 1
-            + (local_hour - 12.0) / 24.0
+            + (decimal_hour - 12.0) / 24.0
         )
     )
 
-    # Ecuación del tiempo, en minutos.
     equation_time = 229.18 * (
         0.000075
         + 0.001868 * math.cos(gamma)
@@ -592,7 +1011,6 @@ def solar_position(hour, config, day_offset=0):
         - 0.040849 * math.sin(2.0 * gamma)
     )
 
-    # Declinación solar, en radianes.
     declination = (
         0.006918
         - 0.399912 * math.cos(gamma)
@@ -603,16 +1021,19 @@ def solar_position(hour, config, day_offset=0):
         + 0.00148 * math.sin(3.0 * gamma)
     )
 
-    # Tiempo solar verdadero.
+    utc_offset_hours = (
+        solar_dt.utcoffset().total_seconds() / 3600.0
+    )
+
     time_offset = (
         equation_time
-        + 4.0 * (
-            longitude - 15.0 * utc_offset
-        )
+        + 4.0 * longitude
+        - 60.0 * utc_offset_hours
     )
 
     true_solar_minutes = (
-        local_hour * 60.0 + time_offset
+        decimal_hour * 60.0
+        + time_offset
     )
 
     hour_angle = math.radians(
@@ -659,15 +1080,20 @@ def solar_position(hour, config, day_offset=0):
         cos_zenith
     )
 
-
 def solar_irradiance_on_vertical_facade(
-        ghi, hour, orientation, config, day_offset=0):
+        ghi, hour, orientation, config, day_offset=0,
+        dni=None, dhi=None, timestamp=None):
     """
-    Estima la irradiancia solar sobre una fachada vertical.
+    Estima la irradiancia sobre una fachada vertical.
+
+    Utiliza DNI y DHI directamente cuando están disponibles.
+    Si no están disponibles, descompone GHI mediante Erbs.
 
     Entrada:
         ghi: irradiancia global horizontal, W/m².
         orientation: N, NE, E, SE, S, SO, O, NO o azimut numérico.
+
+    El azimut se mide desde el norte, en sentido horario.
 
     Se utiliza una descomposición aproximada de Erbs para estimar
     radiación difusa y directa a partir de GHI.
@@ -684,34 +1110,45 @@ def solar_irradiance_on_vertical_facade(
     elevation, sun_azimuth, cos_zenith = solar_position(
         hour,
         config,
-        day_offset
+        day_offset,
+        timestamp
     )
 
     if elevation <= 0.0 or cos_zenith <= 0.0:
         return 0.0
 
+    # --------------------------------------------------------------
+    # ORIENTACIÓN
+    # --------------------------------------------------------------
     # Orientaciones no especificadas: promedio de las ocho fachadas.
     if isinstance(orientation, str):
 
         orientation = orientation.strip().upper()
 
-        if orientation in ("AVERAGE", "MEDIA", "DESCONOCIDA"):
+        if orientation in (
+            "AVERAGE",
+            "MEDIA",
+            "DESCONOCIDA"
+        ):
 
-            values = [
+            orientations = (
+                "N", "NE", "E", "SE",
+                "S", "SO", "O", "NO"
+            )
+
+            return sum(
                 solar_irradiance_on_vertical_facade(
                     ghi,
                     hour,
                     key,
                     config,
-                    day_offset
+                    day_offset,
+                    dni,
+                    dhi,
+                    timestamp
                 )
-                for key in (
-                    "N", "NE", "E", "SE",
-                    "S", "SO", "O", "NO"
-                )
-            ]
-
-            return sum(values) / len(values)
+                for key in orientations
+            ) / len(orientations)
 
         if orientation not in SOLAR_ORIENTATIONS:
             raise ValueError(
@@ -719,87 +1156,93 @@ def solar_irradiance_on_vertical_facade(
                 % orientation
             )
 
-        facade_azimuth = SOLAR_ORIENTATIONS[
-            orientation
-        ]
+        facade_azimuth = SOLAR_ORIENTATIONS[orientation]
 
     else:
+
         facade_azimuth = float(orientation) % 360.0
 
-    # Irradiancia extraterrestre normal.
-    day = date.fromisoformat(
-        str(config.get(
-            "solar_date",
-            date.today().isoformat()
-        ))[:10]
-    ) + timedelta(days=int(day_offset))
+    # --------------------------------------------------------------
+    # 1. RADIACIÓN DIRECTA Y DIFUSA
+    # --------------------------------------------------------------
 
-    day_number = day.timetuple().tm_yday
+    if dni is not None and dhi is not None:
 
-    i0_normal = (
-        1367.0
-        * (
-            1.0
-            + 0.033
-            * math.cos(
-                2.0 * math.pi * day_number / 365.0
+        # Datos directos del pronóstico meteorológico.
+        dni = max(0.0, float(dni))
+        dhi = max(0.0, float(dhi))
+
+    else:
+
+        # Respaldo para perfiles meteorológicos antiguos.
+        # Descomposición empírica de Erbs a partir de GHI.
+
+        if timestamp:
+            dt = datetime.fromisoformat(str(timestamp))
+            day_number = dt.timetuple().tm_yday
+        else:
+            base_date = date.fromisoformat(
+                str(config.get(
+                    "solar_date",
+                    date.today().isoformat()
+                ))[:10]
+            )
+
+            day_number = (
+                base_date + timedelta(days=int(day_offset))
+            ).timetuple().tm_yday
+
+        i0_normal = (
+            1367.0
+            * (
+                1.0
+                + 0.033
+                * math.cos(
+                    2.0 * math.pi * day_number / 365.0
+                )
             )
         )
-    )
 
-    i0_horizontal = (
-        i0_normal * cos_zenith
-    )
-
-    # Índice de claridad atmosférica.
-    kt = clamp(
-        ghi / max(1.0, i0_horizontal),
-        0.0,
-        1.2
-    )
-
-    # Fracción difusa de Erbs.
-    if kt <= 0.22:
-
-        diffuse_fraction = (
-            1.0 - 0.09 * kt
+        i0_horizontal = (
+            i0_normal * cos_zenith
         )
 
-    elif kt <= 0.80:
-
-        diffuse_fraction = (
-            0.9511
-            - 0.1604 * kt
-            + 4.388 * kt ** 2
-            - 16.638 * kt ** 3
-            + 12.336 * kt ** 4
+        # Índice de claridad atmosférica.
+        kt = clamp(
+            ghi / max(1.0, i0_horizontal),
+            0.0,
+            1.2
         )
 
-    else:
+        # Fracción difusa de Erbs.
+        if kt <= 0.22:
 
-        diffuse_fraction = 0.165
+            diffuse_fraction = (
+                1.0 - 0.09 * kt
+            )
 
-    diffuse_fraction = clamp(
-        diffuse_fraction,
-        0.0,
-        1.0
-    )
+        elif kt <= 0.80:
 
-    dhi = (
-        ghi * diffuse_fraction
-    )
+            diffuse_fraction = (
+                0.9511
+                - 0.1604 * kt
+                + 4.388 * kt ** 2
+                - 16.638 * kt ** 3
+                + 12.336 * kt ** 4
+            )
 
-    # Cerca del horizonte la descomposición directa resulta inestable.
-    if cos_zenith < 0.065:
+        else:
 
-        dni = 0.0
-        dhi = ghi
+            diffuse_fraction = 0.165
 
-    else:
+        dhi = (
+            ghi * clamp(diffuse_fraction, 0.0, 1.0)
+        )
 
+        # Cerca del horizonte la descomposición directa resulta inestable.
         dni = (
             max(0.0, ghi - dhi)
-            / cos_zenith
+            / max(0.065, cos_zenith)
         )
 
         dni = min(
@@ -808,7 +1251,7 @@ def solar_irradiance_on_vertical_facade(
         )
 
     # --------------------------------------------------------------
-    # COMPONENTE DIRECTA SOBRE LA FACHADA VERTICAL
+    # 2. COMPONENTE DIRECTA SOBRE EL PLANO VERTICAL
     # --------------------------------------------------------------
 
     cos_elevation = math.sqrt(
@@ -829,15 +1272,16 @@ def solar_irradiance_on_vertical_facade(
     )
 
     # --------------------------------------------------------------
-    # COMPONENTE DIFUSA DEL CIELO
+    # 3. COMPONENTE DIFUSA DEL CIELO
     # --------------------------------------------------------------
 
+    # Modelo isotrópico de cielo para un plano vertical.
     diffuse_plane = (
         dhi * 0.5
     )
 
     # --------------------------------------------------------------
-    # COMPONENTE REFLEJADA POR EL SUELO
+    # 4. COMPONENTE REFLEJADA POR EL TERRENO
     # --------------------------------------------------------------
 
     albedo = clamp(
@@ -862,29 +1306,60 @@ def solar_irradiance_on_vertical_facade(
         + ground_reflected
     )
 
-
-def room_solar_gain_w(room, ghi, config,
-                      hour, day_offset=0):
+def room_solar_gain_w(room, weather, config,
+                      hour=None, day_offset=0):
     """
-    Calcula las ganancias solares transmitidas a una estancia.
+    Calcula la ganancia solar transmitida al interior de una estancia.
 
-    Cada grupo de ventanas tiene:
-        orientation
-        area_m2
-        g_factor
-        shade_factor
+    Cada grupo de ventanas define:
+        orientation: orientación de la fachada.
+        area_m2: superficie total del hueco.
+        g_factor: factor solar del acristalamiento.
+        shade_factor: reducción por sombreamiento.
 
-    Las configuraciones antiguas utilizan window_area y una
-    orientación media de las ocho fachadas.
+    La superficie acristalada efectiva se obtiene multiplicando
+    la superficie del hueco por solar_glazing_area_factor.
+
+    La irradiancia global, directa y difusa procede del perfil
+    meteorológico exterior.
     """
 
     if not config.get("solar_enabled", True):
         return 0.0
 
+    if isinstance(weather, dict):
+
+        ghi = max(
+            0.0,
+            float(weather.get("solar", 0.0))
+        )
+
+        dni = weather.get("dni")
+        dhi = weather.get("dhi")
+
+        timestamp = weather.get("timestamp")
+
+        solar_hour = int(
+            weather.get(
+                "hour",
+                0 if hour is None else hour
+            )
+        )
+
+    else:
+
+        # Compatibilidad con llamadas antiguas.
+        ghi = max(0.0, float(weather))
+        dni = None
+        dhi = None
+        timestamp = None
+        solar_hour = 0 if hour is None else int(hour)
+
     groups = room.get("window_groups")
 
     if not isinstance(groups, list) or not groups:
 
+        # Compatibilidad con estancias configuradas anteriormente.
         groups = [
             {
                 "orientation": "AVERAGE",
@@ -921,10 +1396,7 @@ def room_solar_gain_w(room, ghi, config,
             float(
                 group.get(
                     "g_factor",
-                    group.get(
-                        "solar_factor",
-                        config.get("solar_factor", 0.55)
-                    )
+                    config.get("solar_factor", 0.55)
                 )
             ),
             0.0,
@@ -953,19 +1425,22 @@ def room_solar_gain_w(room, ghi, config,
         facade_irradiance = (
             solar_irradiance_on_vertical_facade(
                 ghi,
-                hour,
+                solar_hour,
                 orientation,
                 config,
-                day_offset
+                day_offset,
+                dni,
+                dhi,
+                timestamp
             )
         )
 
-        effective_area = (
+        effective_glazing_area = (
             area * glazing_factor
         )
 
         total_solar_w += (
-            effective_area
+            effective_glazing_area
             * g_factor
             * shade_factor
             * facade_irradiance
@@ -1766,6 +2241,7 @@ def simulate_room_substep(room, state, config, weather,
 
     t = float(state["temperature"])
     w = max(0.0, float(state["w"]))
+    w_before_ventilation = w
 
     tout = float(weather["temperature"])
     rhout = float(weather["rh"])
@@ -2004,17 +2480,15 @@ def simulate_room_substep(room, state, config, weather,
         # la ventana configurada como abierta produce su caudal manual.
         ach_window_used = ach_window_limit
 
-    # Renovación total efectiva solicitada.
+    # Renovación total efectiva.
     ach_total = (
         ach_base + ach_window_used
     )
 
-    ventilation_w = 0.0
-
+    # Solución exponencial del balance de humedad.
+    # Se supone un caudal constante durante el subpaso.
     if ach_total > 0.0:
 
-        # Solución exponencial del balance de humedad para un caudal
-        # constante durante todo el subpaso.
         decay = math.exp(
             -ach_total * dt_h
         )
@@ -2026,52 +2500,6 @@ def simulate_room_substep(room, state, config, weather,
         )
 
         w = max(0.0, w)
-
-
-        # Fracción de aire sustituida durante el subpaso.
-        # Se obtiene de la solución exponencial para ACH constante.
-        exchange_fraction = (
-            1.0 - decay
-        )
-
-        # Límite de estabilidad para intercambios muy elevados.
-        # Se aplica también al balance de humedad, para mantener
-        # la coherencia entre la masa y la energía intercambiadas.
-        exchange_fraction = min(
-            0.45,
-            max(0.0, exchange_fraction)
-        )
-
-        # Masa seca intercambiada durante el subpaso.
-        exchanged_dry_mass = (
-            dry_mass * exchange_fraction
-        )
-
-        # Capacidad calorífica específica sensible del aire húmedo.
-        # Se utiliza un valor medio entre el aire interior y exterior.
-        # No se incluye el término de calor latente de vaporización.
-        cp_inside = CP_AIR + 1860.0 * max(
-            0.0,
-            float(state["w"])
-        )
-
-        cp_outside = CP_AIR + 1860.0 * wout
-
-        cp_exchange = (
-            cp_inside + cp_outside
-        ) / 2.0
-
-        # Transporte de energía sensible.
-        ventilation_energy_j = (
-            exchanged_dry_mass
-            * cp_exchange
-            * (tout - t)
-        )
-
-        # Potencia térmica media equivalente del intercambio.
-        ventilation_w = (
-            ventilation_energy_j / dt_s
-        )
 
         state["ventilation_m3"] += (
             ach_total * volume * dt_h
@@ -2095,7 +2523,7 @@ def simulate_room_substep(room, state, config, weather,
     people = room_occupancy(
         room,
         config,
-        hour
+        int(weather.get("hour", hour))
     )
 
     moisture_per_person = max(
@@ -2131,9 +2559,9 @@ def simulate_room_substep(room, state, config, weather,
 
     solar_w = room_solar_gain_w(
         room,
-        solar_ghi,
+        weather,
         config,
-        int(weather["hour"]),
+        hour,
         int(hour) // 24
     )
 
@@ -2256,7 +2684,7 @@ def simulate_room_substep(room, state, config, weather,
     ) / 2.0
 
     mean_w = (
-        max(0.0, w)
+        max(0.0, w_before_ventilation)
         + max(0.0, wout)
     ) / 2.0
 
@@ -2547,7 +2975,6 @@ def simulate_room_substep(room, state, config, weather,
 
         "ventilation_ach": ach_total,
         "ventilation_window_ach": ach_window_used,
-        "ventilation_w": ventilation_w,
         "heater_kwh_th": heater_kwh_th,
         "heating_type": heating_type
     }
@@ -2654,6 +3081,7 @@ def room_hour_result(room, state, config, psych, weather,
 
     result = {
         "hour": hour,
+        "time": weather.get("timestamp"),
 
         "tout": tout,
         "rhout": float(weather["rh"]),
@@ -2749,8 +3177,35 @@ def room_hour_result(room, state, config, psych, weather,
 # SIMULACION MULTIESTANCIA
 # ---------------------------------------------------------------------------
 
-def normalize_weather_row(row):
-    """Convierte una fila meteorológica en un diccionario."""
+def normalize_weather_row(row, timestamp=None,
+                          utc_offset_seconds=None):
+    """
+    Convierte una fila meteorológica en un diccionario normalizado.
+
+    Admite:
+        - Filas antiguas con 4 campos.
+        - Filas actuales con 6 campos.
+        - Filas nuevas con 8 campos, incluidas DNI y DHI.
+    """
+
+    if isinstance(row, dict):
+
+        return {
+            "hour": int(row.get("hour", 0)),
+            "temperature": float(row["temperature"]),
+            "rh": float(row["rh"]),
+            "solar": float(row.get("solar", 0.0)),
+            "wind_speed_m_s": float(
+                row.get("wind_speed_m_s", 0.0)
+            ),
+            "wind_direction_deg": row.get(
+                "wind_direction_deg"
+            ),
+            "dni": row.get("dni"),
+            "dhi": row.get("dhi"),
+            "timestamp": timestamp
+        }
+
     return {
         "hour": int(row[0]),
         "temperature": float(row[1]),
@@ -2761,9 +3216,20 @@ def normalize_weather_row(row):
         ),
         "wind_direction_deg": (
             float(row[5]) if len(row) > 5 else None
-        )
+        ),
+        "dni": (
+            None
+            if len(row) <= 6 or row[6] is None
+            else float(row[6])
+        ),
+        "dhi": (
+            None
+            if len(row) <= 7 or row[7] is None
+            else float(row[7])
+        ),
+        "timestamp": timestamp,
+        "utc_offset_seconds": utc_offset_seconds
     }
-
 
 def normalize_connections(config, room_names):
     """
@@ -2835,10 +3301,21 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
             "No hay estancias configuradas."
         )
 
-    if len(config.get("weather", [])) < 24:
+    weather_rows = config.get("weather", [])
+
+    if len(weather_rows) < min(int(hours), 24):
         raise ValueError(
-            "El perfil meteorológico debe contener 24 horas."
+            "El perfil meteorológico no contiene suficientes horas."
         )
+
+    weather_times = config.get(
+        "weather_times",
+        []
+    )
+
+    weather_utc_offset = config.get(
+        "weather_utc_offset_seconds"
+    )
 
     hours = int(hours)
     substep_minutes = float(substep_minutes)
@@ -2927,10 +3404,22 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
 
     for hour in range(hours):
 
-        wx_row = config["weather"][hour % 24]
+        weather_index = (
+            hour % len(weather_rows)
+        )
+
+        wx_row = weather_rows[weather_index]
+
+        timestamp = (
+            weather_times[weather_index]
+            if weather_index < len(weather_times)
+            else None
+        )
 
         weather = normalize_weather_row(
-            wx_row
+            wx_row,
+            timestamp,
+            weather_utc_offset
         )
 
         # ----------------------------------------------------------
@@ -3240,6 +3729,7 @@ def simulate(config, selected_room=None, hours=24, substep_minutes=5):
         global_results.append({
 
             "hour": index,
+            "time": room_rows[0].get("time"),
 
             # Estado final global.
             "tin": mean_t,
@@ -3692,6 +4182,103 @@ def validate_config(cfg):
 # INTERFAZ GRAFICA
 # ---------------------------------------------------------------------------
 
+class ToolTip:
+    """
+    Globo descriptivo para controles Tkinter.
+
+    Se muestra al pasar el puntero o al mantener pulsado el control.
+    """
+
+    def __init__(self, widget, text, delay_ms=650):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.after_id = None
+        self.popup = None
+
+        widget.bind(
+            "<Enter>",
+            self._schedule,
+            add="+"
+        )
+
+        widget.bind(
+            "<Leave>",
+            self._hide,
+            add="+"
+        )
+
+        widget.bind(
+            "<ButtonPress-1>",
+            self._schedule,
+            add="+"
+        )
+
+        widget.bind(
+            "<ButtonRelease-1>",
+            self._hide,
+            add="+"
+        )
+
+    def _schedule(self, event=None):
+        self._cancel_schedule()
+
+        self.after_id = self.widget.after(
+            self.delay_ms,
+            self._show
+        )
+
+    def _cancel_schedule(self):
+        if self.after_id is not None:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except Exception:
+                pass
+
+            self.after_id = None
+
+    def _show(self):
+        self.after_id = None
+
+        if self.popup is not None or not self.text:
+            return
+
+        self.popup = tk.Toplevel(
+            self.widget
+        )
+
+        self.popup.wm_overrideredirect(True)
+
+        label = ttk.Label(
+            self.popup,
+            text=self.text,
+            justify="left",
+            wraplength=320,
+            padding=8,
+            relief="solid"
+        )
+
+        label.pack()
+
+        x = (
+            self.widget.winfo_rootx()
+            + self.widget.winfo_width()
+            + 6
+        )
+
+        y = self.widget.winfo_rooty()
+
+        self.popup.wm_geometry(
+            "+%d+%d" % (x, y)
+        )
+
+    def _hide(self, event=None):
+        self._cancel_schedule()
+
+        if self.popup is not None:
+            self.popup.destroy()
+            self.popup = None
+
 class App:
     """
     Interfaz gráfica del simulador higrotérmico.
@@ -3737,8 +4324,23 @@ class App:
             padding=(4, 6)
         )
 
+        style.configure(
+            "Vertical.TScrollbar",
+            arrowsize=16
+        )
+
+        style.configure(
+            "Horizontal.TScrollbar",
+            arrowsize=16
+        )
+
         self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self.nb.pack(
+            fill="both",
+            expand=True,
+            padx=8,
+            pady=8
+        )
 
         self.tab_sim = ttk.Frame(self.nb)
         self.tab_general = ttk.Frame(self.nb)
@@ -3824,10 +4426,11 @@ class App:
             highlightthickness=0
         )
 
-        scroll = ttk.Scrollbar(
+        scroll = tk.Scrollbar(
             container,
             orient="vertical",
-            command=canvas.yview
+            command=canvas.yview,
+            width=16
         )
 
         inner = ttk.Frame(canvas)
@@ -3858,243 +4461,341 @@ class App:
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-        inner.grid_columnconfigure(0, weight=1)
-        inner.grid_columnconfigure(1, weight=1)
 
         self.general_vars = {}
         self.general_bool_vars = {}
 
-        # ------------------------------------------------------------------
-        # CONSTRUCTOR DE GRUPOS
-        # ------------------------------------------------------------------
+        self.general_thermal_profile_var = tk.StringVar()
 
-        def add_group(title, row, column, fields):
+        # --------------------------------------------------------------
+        # CONSTRUCTOR DE GRUPOS
+        # --------------------------------------------------------------
+
+        def add_group(title, fields):
+
             group = ttk.LabelFrame(
                 inner,
                 text=title
             )
 
-            group.grid(
-                row=row,
-                column=column,
-                sticky="nsew",
-                padx=6,
-                pady=6
+            group.pack(
+                fill="x",
+                expand=True,
+                padx=5,
+                pady=5
             )
 
-            group.grid_columnconfigure(1, weight=1)
+            group.grid_columnconfigure(
+                0,
+                weight=1
+            )
 
-            for index, (key, label) in enumerate(fields):
+            group.grid_columnconfigure(
+                1,
+                minsize=150
+            )
 
-                # Controles booleanos.
-                if key in (
-                    "ventilation_control",
-                    "solar_enabled"
-                ):
+            for row, (key, label_text, kind) in enumerate(fields):
+
+                label = ttk.Label(
+                    group,
+                    text=label_text,
+                    justify="left",
+                    anchor="w"
+                )
+
+                label.grid(
+                    row=row,
+                    column=0,
+                    sticky="ew",
+                    padx=8,
+                    pady=5
+                )
+
+                ToolTip(
+                    label,
+                    PARAMETER_TIPS.get(
+                        key,
+                        label_text
+                    )
+                )
+
+                if kind == "bool":
+
                     var = tk.BooleanVar(
-                        value=bool(self.cfg.get(key, False))
+                        value=bool(
+                            self.cfg.get(key, False)
+                        )
                     )
 
                     self.general_bool_vars[key] = var
 
-                    ttk.Checkbutton(
+                    control = ttk.Checkbutton(
                         group,
-                        text=label,
                         variable=var
-                    ).grid(
-                        row=index,
-                        column=0,
-                        columnspan=2,
-                        sticky="w",
-                        padx=7,
+                    )
+
+                    control.grid(
+                        row=row,
+                        column=1,
+                        sticky="e",
+                        padx=10,
                         pady=5
                     )
 
-                # Selector del tipo de calefacción.
-                elif key == "heating_type":
-                    ttk.Label(
-                        group,
-                        text=label
-                    ).grid(
-                        row=index,
-                        column=0,
-                        sticky="w",
-                        padx=7,
-                        pady=4
+                    var.trace_add(
+                        "write",
+                        self._invalidate_simulation
                     )
 
-                    var = tk.StringVar(
-                        value=str(
-                            self.cfg.get(key, "butane")
+                else:
+
+                    if kind == "choice":
+
+                        var = tk.StringVar(
+                            value=str(
+                                self.cfg.get(key, "")
+                            )
                         )
-                    )
 
-                    self.general_vars[key] = var
-
-                    ttk.Combobox(
-                        group,
-                        textvariable=var,
-                        values=(
+                        values = (
                             "butane",
                             "electric",
                             "heat_pump"
-                        ),
-                        state="readonly",
-                        width=18
-                    ).grid(
-                        row=index,
-                        column=1,
-                        sticky="ew",
-                        padx=7,
-                        pady=4
-                    )
+                        )
 
-                # Controles numéricos.
-                else:
-                    ttk.Label(
-                        group,
-                        text=label
-                    ).grid(
-                        row=index,
-                        column=0,
-                        sticky="w",
-                        padx=7,
-                        pady=4
-                    )
+                        control = ttk.Combobox(
+                            group,
+                            textvariable=var,
+                            values=values,
+                            state="readonly",
+                            width=18
+                        )
 
-                    var = tk.StringVar(
-                        value=str(self.cfg.get(key, ""))
-                    )
+                    else:
+
+                        value = self.cfg.get(key, "")
+
+                        var = tk.StringVar(
+                            value="" if value is None
+                            else str(value)
+                        )
+
+                        control = ttk.Entry(
+                            group,
+                            textvariable=var,
+                            width=18
+                        )
 
                     self.general_vars[key] = var
 
-                    ttk.Entry(
-                        group,
-                        textvariable=var,
-                        width=16
-                    ).grid(
-                        row=index,
+                    control.grid(
+                        row=row,
                         column=1,
-                        sticky="ew",
-                        padx=7,
-                        pady=4
+                        sticky="e",
+                        padx=8,
+                        pady=5
                     )
+
+                    var.trace_add(
+                        "write",
+                        self._invalidate_simulation
+                    )
+
+            # Ajusta automáticamente el ancho de las etiquetas.
+            def resize_labels(event):
+                available = max(
+                    90,
+                    event.width - 175
+                )
+
+                for child in group.winfo_children():
+
+                    if isinstance(child, ttk.Label):
+                        child.configure(
+                            wraplength=available
+                        )
+
+            group.bind(
+                "<Configure>",
+                resize_labels
+            )
 
             return group
 
-        # ------------------------------------------------------------------
-        # GRUPO 1: CONDICIONES PSICROMÉTRICAS
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # CONDICIONES PSICROMÉTRICAS
+        # --------------------------------------------------------------
 
         add_group(
             "Condiciones iniciales y consignas",
-            0,
-            0,
             [
-                ("pressure_pa", "Presión atmosférica (Pa)"),
-                ("initial_temperature", "Temperatura inicial (°C)"),
-                ("initial_rh", "Humedad relativa inicial (%)"),
-                ("target_temperature", "Consigna de temperatura (°C)"),
-                ("target_rh", "Consigna de humedad relativa (%)")
+                ("pressure_pa", "Presión atmosférica (Pa)", "float"),
+                ("initial_temperature", "Temperatura inicial (°C)", "float"),
+                ("initial_rh", "Humedad relativa inicial (%)", "float"),
+                ("target_temperature", "Consigna de temperatura (°C)", "float"),
+                ("target_rh", "Consigna de humedad relativa (%)", "float")
             ]
         )
 
-        # ------------------------------------------------------------------
-        # GRUPO 2: OCUPACIÓN Y GANANCIAS INTERNAS
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # OCUPACIÓN Y GANANCIAS
+        # --------------------------------------------------------------
 
         add_group(
             "Ocupación y ganancias internas",
-            0,
-            1,
             [
-                ("occupancy_start", "Hora de inicio de ocupación"),
-                ("occupancy_end", "Hora de fin de ocupación"),
-                ("moisture_per_person_g_h", "Humedad por persona (g/h)"),
-                ("sensible_gain_per_person_w", "Ganancia sensible por persona (W)"),
-                ("internal_gain_w", "Ganancia interna predeterminada (W)")
+                ("occupancy_start", "Hora de inicio de ocupación", "float"),
+                ("occupancy_end", "Hora de fin de ocupación", "float"),
+                ("moisture_per_person_g_h", "Humedad generada por persona (g/h)", "float"),
+                ("sensible_gain_per_person_w", "Ganancia sensible por persona (W)", "float"),
+                ("internal_gain_w", "Aporte térmico medio de equipos y aparatos (W)", "float")
             ]
         )
 
-        # ------------------------------------------------------------------
-        # GRUPO 3: VENTILACIÓN
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # VENTILACIÓN
+        # --------------------------------------------------------------
 
         add_group(
             "Ventilación",
-            1,
-            0,
             [
-                ("ventilation_max_ach", "ACH máximo adicional"),
-                ("ventilation_control", "Habilitar ventilación por humedad")
+                ("ventilation_max_ach", "ACH máximo total", "float"),
+                ("ventilation_control", "Habilitar ventilación automática por humedad", "bool")
             ]
         )
 
-        # ------------------------------------------------------------------
-        # GRUPO 4: VALORES PREDETERMINADOS DE LAS ESTANCIAS
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # VALORES PREDETERMINADOS DE ESTANCIAS
+        # --------------------------------------------------------------
 
         add_group(
             "Valores predeterminados para nuevas estancias",
-            1,
-            1,
             [
-                ("air_changes_h", "Renovaciones base (1/h)"),
-                ("thermal_mass_j_m2k", "Masa térmica (J/m²K)")
+                ("air_changes_h", "Renovaciones base (1/h)", "float"),
+                ("thermal_mass_j_m2k", "Inercia térmica efectiva (J/m²K)", "float")
             ]
         )
 
-        # ------------------------------------------------------------------
-        # GRUPO 5: EQUIPOS - VALORES GENERALES DE REFERENCIA
-        # ------------------------------------------------------------------
+        # Selector de nivel de inercia para el valor general.
+        # El campo numérico sigue siendo editable.
+        thermal_frame = ttk.Frame(inner)
+        thermal_frame.pack(
+            fill="x",
+            padx=12,
+            pady=(0, 8)
+        )
+
+        ttk.Label(
+            thermal_frame,
+            text="Nivel de inercia térmica"
+        ).pack(side="left")
+
+        self.general_thermal_profile_var.set(
+            self.cfg.get(
+                "thermal_mass_profile",
+                "Personalizada"
+            )
+        )
+
+        self.general_thermal_profile = ttk.Combobox(
+            thermal_frame,
+            textvariable=self.general_thermal_profile_var,
+            values=(
+                "Ligera",
+                "Media",
+                "Pesada",
+                "Muy pesada",
+                "Personalizada"
+            ),
+            state="readonly",
+            width=18
+        )
+
+        self.general_thermal_profile.pack(
+            side="right"
+        )
+
+        self.general_thermal_profile.bind(
+            "<<ComboboxSelected>>",
+            self._on_general_thermal_profile
+        )
+
+        # --------------------------------------------------------------
+        # EQUIPOS
+        # --------------------------------------------------------------
 
         add_group(
             "Parámetros generales de equipos",
-            2,
-            0,
             [
-                ("dehumidifier_l_day", "Capacidad deshumidificador (L/día)"),
-                ("dehumidifier_power_kw", "Potencia deshumidificador (kW)"),
-                ("dehumidifier_heat_factor", "Factor térmico deshumidificador"),
-                ("heater_kw", "Potencia calefacción (kW térmicos)"),
-                ("heating_type", "Tipo de calefacción"),
-                ("heat_pump_cop", "COP bomba de calor"),
-                ("combustion_moisture_g_kwh", "Humedad combustión (g/kWh)")
+                ("dehumidifier_l_day", "Capacidad de deshumidificación (L/día)", "float"),
+                ("dehumidifier_power_kw", "Potencia eléctrica del deshumidificador (kW)", "float"),
+                ("dehumidifier_heat_factor", "Factor de aportación térmica eléctrica", "float"),
+                ("heater_kw", "Potencia térmica de calefacción (kW)", "float"),
+                ("heating_type", "Tipo de calefacción", "choice"),
+                ("heat_pump_cop", "COP de bomba de calor", "float"),
+                ("combustion_moisture_g_kwh", "Humedad generada por combustión (g/kWh)", "float")
             ]
         )
 
-        # ------------------------------------------------------------------
-        # GRUPO 6: RADIACIÓN Y CONDENSACIÓN
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # LOCALIZACIÓN
+        # --------------------------------------------------------------
 
         add_group(
-            "Radiación solar e indicador superficial",
-            2,
-            1,
+            "Localización de la vivienda",
             [
-                ("solar_enabled", "Habilitar ganancias solares"),
-                ("solar_factor", "Factor solar"),
-                ("surface_factor", "Factor superficial fRsi")
+                ("latitude_deg", "Latitud (grados decimales)", "float"),
+                ("longitude_deg", "Longitud (grados decimales)", "float"),
+                ("altitude_m", "Altitud sobre el nivel del mar (m)", "float")
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # RADIACIÓN SOLAR
+        # --------------------------------------------------------------
+
+        add_group(
+            "Modelo de aportación solar",
+            [
+                ("solar_enabled", "Habilitar ganancias solares", "bool"),
+                ("solar_factor", "Factor solar del acristalamiento g", "float"),
+                ("solar_glazing_area_factor", "Fracción acristalada del hueco", "float"),
+                ("solar_shading_factor", "Factor global de sombra", "float"),
+                ("solar_ground_reflectance", "Reflectancia del terreno", "float")
+            ]
+        )
+
+        add_group(
+            "Fecha de referencia",
+            [
+                ("solar_date", "Fecha manual para perfiles meteorológicos antiguos (AAAA-MM-DD)", "float")
             ]
         )
 
         ttk.Label(
             inner,
             text=(
-                "Los parámetros de equipos de esta pestaña son valores "
-                "generales de referencia. La disponibilidad real de cada "
-                "equipo se establece individualmente en la pestaña Estancias."
+                "Los parámetros globales de equipos son valores de referencia. "
+                "La disponibilidad efectiva de calefacción y deshumidificación "
+                "se establece por separado en cada estancia."
             ),
-            wraplength=900
-        ).grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            sticky="w",
+            wraplength=700,
+            justify="left"
+        ).pack(
+            anchor="w",
             padx=10,
             pady=12
         )
-    
+
+    def _on_general_thermal_profile(self, event=None):
+        profile = self.general_thermal_profile_var.get()
+
+        if profile in THERMAL_MASS_PRESETS:
+            self.general_vars["thermal_mass_j_m2k"].set(
+                str(THERMAL_MASS_PRESETS[profile])
+            )    
+
     # -----------------------------------------------------------------------
     # PESTAÑA DE SIMULACION
     # -----------------------------------------------------------------------
@@ -4189,17 +4890,19 @@ class App:
         )
 
         # Barra vertical.
-        scroll_y = ttk.Scrollbar(
+        scroll_y = tk.Scrollbar(
             result_frame,
             orient="vertical",
-            command=self.summary.yview
+            command=self.summary.yview,
+            width=16
         )
 
         # Barra horizontal.
-        scroll_x = ttk.Scrollbar(
+        scroll_x = tk.Scrollbar(
             result_frame,
             orient="horizontal",
-            command=self.summary.xview
+            command=self.summary.xview,
+            width=16
         )
 
         self.summary.configure(
@@ -4347,16 +5050,12 @@ class App:
             ("Superficie suelo (m²)", "floor_area", float),
 
             ("Ventanas (m²)", "window_area", float),
-            ("U ventanas (W/m²K)", "window_u", float),
 
             ("Muros exteriores (m²)", "wall_area", float),
-            ("U muros (W/m²K)", "wall_u", float),
 
             ("Cubierta exterior (m²)", "roof_area", float),
-            ("U cubierta (W/m²K)", "roof_u", float),
 
             ("Suelo expuesto (m²)", "floor_exposed_area", float),
-            ("U suelo (W/m²K)", "floor_u", float),
 
             ("Renovaciones base (1/h)", "air_changes_h", float),
             ("Masa térmica (J/m²K)", "thermal_mass_j_m2k", float),
@@ -5534,12 +6233,20 @@ class App:
     # -----------------------------------------------------------------------
 
     def _collect_main_fields(self):
-        # Parámetros numéricos y de selección.
+        """
+        Actualiza directamente las claves del JSON desde la pestaña general.
+        """
+
+        before = copy.deepcopy(self.cfg)
+
         for key, var in self.general_vars.items():
 
             value = var.get().strip()
 
-            if key == "heating_type":
+            if key in (
+                "heating_type",
+                "solar_date"
+            ):
                 self.cfg[key] = value
 
             elif key in (
@@ -5548,6 +6255,13 @@ class App:
             ):
                 self.cfg[key] = self._to_int(value)
 
+            elif key == "altitude_m":
+
+                self.cfg[key] = (
+                    None if not value
+                    else self._to_float(value)
+                )
+
             else:
                 self.cfg[key] = self._to_float(value)
 
@@ -5555,13 +6269,26 @@ class App:
         for key, var in self.general_bool_vars.items():
             self.cfg[key] = bool(var.get())
 
+        profile = self.general_thermal_profile_var.get()
+
+        self.cfg["thermal_mass_profile"] = profile
+
+        if self.cfg != before:
+            self._invalidate_simulation()
+
         # Validación horaria.
         for key in ("occupancy_start", "occupancy_end"):
+
             if not 0 <= int(self.cfg[key]) <= 23:
                 raise ValueError(
                     "%s debe estar comprendida entre 0 y 23."
                     % key
                 )
+
+        if self.cfg["solar_date"]:
+            date.fromisoformat(
+                str(self.cfg["solar_date"])[:10]
+            )
 
     # -----------------------------------------------------------------------
     # SIMULACION
