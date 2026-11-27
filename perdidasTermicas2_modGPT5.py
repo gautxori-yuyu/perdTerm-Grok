@@ -5132,7 +5132,7 @@ class App:
             "floor_u": "Composición de suelo expuesto - U (W/m²K)"
         }
 
-        # row = len(self._room_form_fields)
+        row = len(self._room_form_fields)
 
         for key, label_text in u_labels.items():
 
@@ -5258,7 +5258,8 @@ class App:
             self._invalidate_simulation
         )
 
-        ttk.Combobox(
+        # Selector del perfil de masa térmica de la estancia
+        thermal_combo = ttk.Combobox(
             thermal_frame,
             textvariable=self.room_thermal_profile_var,
             values=(
@@ -5267,9 +5268,11 @@ class App:
             ),
             state="readonly",
             width=18
-        ).pack(
+        )
+        thermal_combo.pack(
             side="left"
-        ).bind(
+        )
+        thermal_combo.bind(
             "<<ComboboxSelected>>",
             self._on_room_thermal_profile_changed
         )
@@ -7210,24 +7213,24 @@ class App:
     # SIMULACION
     # -----------------------------------------------------------------------
 
-def _run(self):
-    try:
-        if not self._ensure_simulation():
-            return
+    def _run(self):
+        try:
+            if not self._ensure_simulation():
+                return
 
-        self._show_results(
-            self.last_simulation
-        )
+            self._show_results(
+                self.last_simulation
+            )
 
-        self._plot(
-            self.last_simulation
-        )
+            self._plot(
+                self.last_simulation
+            )
 
-    except Exception as exc:
-        messagebox.showerror(
-            "Error de simulación",
-            str(exc)
-        )
+        except Exception as exc:
+            messagebox.showerror(
+                "Error de simulación",
+                str(exc)
+            )
 
     def _invalidate_simulation(self, *args):
         """
@@ -7269,7 +7272,6 @@ def _run(self):
             or self.full_simulation is None
             or current_signature != self._simulation_cache_signature
         ):
-
             # Siempre simula la vivienda completa.
             self.full_simulation = simulate(
                 self.cfg,
@@ -7278,10 +7280,7 @@ def _run(self):
                 substep_minutes=5
             )
 
-            self._simulation_cache_signature = (
-                current_signature
-            )
-
+            self._simulation_cache_signature = current_signature
             self._simulation_valid = True
 
         # Selecciona solamente la vista que se presenta.
@@ -7300,7 +7299,7 @@ def _run(self):
 
         return True
 
-     def _on_room_choice_changed(self, event=None):
+    def _on_room_choice_changed(self, event=None):
         """
         Cambia la vista de resultados.
 
@@ -7618,6 +7617,14 @@ def _run(self):
                 var.set(
                     bool(self.cfg.get(key, False))
                 )
+
+            # Sincroniza el perfil de masa térmica mostrado en pantalla.
+            self.general_thermal_profile_var.set(
+                self.cfg.get(
+                    "thermal_mass_profile",
+                    "Personalizado"
+                )
+            )
 
             self.last_simulation = None
             self.full_simulation = None
