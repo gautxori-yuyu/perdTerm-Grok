@@ -3261,6 +3261,115 @@ def normalize_connections(config, room_names):
 
     return connections
 
+import sys
+import os
+import linecache
+import functools
+from datetime import datetime
+
+
+def debug_calculo(func):
+    """
+    Registra los pasos de cálculo de una simulación.
+
+    El fichero se genera junto al script y contiene las líneas
+    ejecutadas, sus comentarios y las variables locales.
+
+    No modifica los resultados del motor.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+
+        # Ubicación del script y fichero de depuración.
+        script = os.path.abspath(__file__)
+        carpeta = os.path.dirname(script)
+        ruta = os.path.join(carpeta, "debug_calculo.txt")
+
+        archivo = open(ruta, "w", encoding="utf-8")
+
+        archivo.write(
+            "DEBUG DEL MOTOR HIGROTÉRMICO\n"
+            "Inicio: {}\n\n".format(datetime.now())
+        )
+
+        # Conservamos cualquier trazador previo.
+        trazador_anterior = sys.gettrace()
+
+        def trace(frame, event, arg):
+            """
+            Registra las líneas ejecutadas dentro del script.
+            """
+
+            # No registrar funciones de otros módulos.
+            if os.path.abspath(frame.f_code.co_filename) != script:
+                return None
+
+            if event == "line":
+
+                numero = frame.f_lineno
+                funcion = frame.f_code.co_name
+
+                # Recuperar el código fuente de la línea.
+                codigo = linecache.getline(
+                    script, numero
+                ).strip()
+
+                archivo.write(
+                    "\n[{}:{}] {}\n".format(
+                        funcion, numero, codigo
+                    )
+                )
+
+                # Registrar el comentario inmediatamente anterior,
+                # cuando exista.
+                comentario = linecache.getline(
+                    script, numero - 1
+                ).strip()
+
+                if comentario.startswith("#"):
+                    archivo.write(
+                        "Comentario: {}\n".format(comentario)
+                    )
+
+                # Registrar las variables locales disponibles.
+                # Los valores corresponden al estado anterior
+                # a la ejecución de la línea indicada.
+                for nombre, valor in frame.f_locals.items():
+
+                    try:
+                        representacion = repr(valor)
+                    except Exception:
+                        representacion = "<no representable>"
+
+                    archivo.write(
+                        "    {} = {}\n".format(
+                            nombre, representacion
+                        )
+                    )
+
+            return trace
+
+        try:
+            # Activar el registro exclusivamente durante
+            # la ejecución de la simulación.
+            sys.settrace(trace)
+
+            return func(*args, **kwargs)
+
+        finally:
+            # Restaurar el estado incluso si hay una excepción.
+            sys.settrace(trazador_anterior)
+
+            archivo.write(
+                "\nFin: {}\n".format(datetime.now())
+            )
+
+            archivo.close()
+
+    return wrapper
+
+@debug_calculo
 def simulate(config, selected_room=None, hours=24, substep_minutes=5):
     """
     Simula la vivienda completa, manteniendo todas las estancias
@@ -4144,8 +4253,8 @@ def validate_config(cfg):
             )
             if flow is None:
                 raise ValueError(
-                    "La conexión custom entre %s y %s necesita un caudal."
-                    % (a, b)
+                    "La conexión custom entre {} y {} necesita "
+                    "un caudal.".format(a, b)
                 )
             if float(flow) < 0:
                 raise ValueError(
@@ -4307,6 +4416,8 @@ class App:
         self._suspend_invalidation = False
 
         self._build_ui()
+        # Ajustar la ventana al escritorio de Windows.
+        self._ajustar_ventana_windows()
         self._refresh_all()
 
     # -----------------------------------------------------------------------
@@ -4364,6 +4475,43 @@ class App:
         self._build_connections_tab()
         self._build_weather_tab()
 
+    def _ajustar_ventana_windows(self):
+        import sys
+        import ctypes
+        from ctypes import wintypes
+
+        # No modificar la geometría de Android u otros sistemas.
+        if sys.platform != "win32":
+            return
+
+        self.update_idletasks()
+
+        # Obtener el área de trabajo, excluida la barra de tareas.
+        rect = wintypes.RECT()
+
+        SPI_GETWORKAREA = 48
+
+        if not ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            ctypes.byref(rect),
+            0
+        ):
+            return
+
+        ancho_disponible = rect.right - rect.left
+        alto_disponible = rect.bottom - rect.top
+
+        # Ventana relativamente estrecha y completamente visible.
+        ancho = min(850, ancho_disponible - 40)
+        alto = min(850, alto_disponible - 40)
+
+        x = rect.left + (ancho_disponible - ancho) // 2
+        y = rect.top + (alto_disponible - alto) // 2
+
+        self.geometry(
+            "{}x{}+{}+{}".format(ancho, alto, x, y)
+        )
     # -----------------------------------------------------------------------
     # UTILIDADES DE INTERFAZ
     # -----------------------------------------------------------------------
@@ -5353,8 +5501,6 @@ class App:
         # EQUIPOS INSTALADOS EN LA ESTANCIA
         # ------------------------------------------------------------------
 
-        row = len(self._room_form_fields)
-
         equipment_frame = ttk.LabelFrame(
             inner,
             text="Equipos instalados en esta estancia"
@@ -5445,7 +5591,7 @@ class App:
             self._invalidate_simulation
         )
 
-        ttk.Combobox(
+        heating_combo = ttk.Combobox(
             inner,
             textvariable=self.room_heating_type_var,
             values=(
@@ -5456,7 +5602,9 @@ class App:
             ),
             state="readonly",
             width=21
-        ).grid(
+        )
+
+        heating_combo.grid(
             row=row,
             column=1,
             padx=8,
@@ -6109,19 +6257,19 @@ class App:
             if heating_type:
                 data["heating_type"] = heating_type
 
-            '''
-            # Ventanas.
+            # Ventanas: estado de apertura.
             data["windows_open"] = bool(
                 self.room_windows_open_var.get()
             )
 
+            # Caudal manual de ventilación por ventanas (m³/h).
             flow = self.room_manual_flow_var.get().strip()
 
             data["window_airflow_m3_h"] = (
                 self._to_float(flow)
                 if flow else None
             )
-            '''
+
             if not data["name"]:
                 raise ValueError(
                     "El nombre no puede estar vacío."
@@ -7214,17 +7362,29 @@ class App:
     # -----------------------------------------------------------------------
 
     def _run(self):
+        import time
         try:
+            t0 = time.perf_counter()
             if not self._ensure_simulation():
                 return
+
+            t1 = time.perf_counter()
 
             self._show_results(
                 self.last_simulation
             )
 
+            t2 = time.perf_counter()
+
             self._plot(
                 self.last_simulation
             )
+
+            t3 = time.perf_counter()
+
+            print("Simulación: {:.3f} s".format(t1 - t0))
+            print("Texto: {:.3f} s".format(t2 - t1))
+            print("Gráfico: {:.3f} s".format(t3 - t2))
 
         except Exception as exc:
             messagebox.showerror(
@@ -7393,6 +7553,7 @@ class App:
             (rows[-1]["tin"], rows[-1]["rh"])
         )
 
+        # Encabezado de las columnas de resultados horarios.
         txt += (
             "Hora  T ext  T int  HR int  TBH  Rocío  Superf.  "
             "Vent  Desh  Cal  Cond.\n"
@@ -7401,7 +7562,7 @@ class App:
         for row in rows:
             txt += (
                 "%02d   %5.1f  %5.1f  %6.1f  %5.1f  %6.1f  "
-                "%4.0f  %4.0f  %4.0f  %5.3f\n"
+                "%6.1f  %4.0f  %4.0f  %4.0f  %5.3f\n"
                 % (
                     row.get("hour", 0),
                     row.get("tout", 0),
