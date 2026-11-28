@@ -3369,7 +3369,7 @@ def debug_calculo(func):
 
     return wrapper
 
-@debug_calculo
+#@debug_calculo
 def simulate(config, selected_room=None, hours=24, substep_minutes=5):
     """
     Simula la vivienda completa, manteniendo todas las estancias
@@ -4484,7 +4484,7 @@ class App:
         if sys.platform != "win32":
             return
 
-        self.update_idletasks()
+        self.root.update_idletasks()
 
         # Obtener el área de trabajo, excluida la barra de tareas.
         rect = wintypes.RECT()
@@ -4509,7 +4509,7 @@ class App:
         x = rect.left + (ancho_disponible - ancho) // 2
         y = rect.top + (alto_disponible - alto) // 2
 
-        self.geometry(
+        self.root.geometry(
             "{}x{}+{}+{}".format(ancho, alto, x, y)
         )
     # -----------------------------------------------------------------------
@@ -6194,14 +6194,29 @@ class App:
             for key, var in self.room_form_vars.items():
 
                 typ = types[key]
-                value = var.get()
+                value = var.get().strip()
 
-                if typ is str:
-                    data[key] = value.strip()
+                # El caudal manual es opcional: un campo vacío
+                # significa que no se ha establecido un caudal manual.
+                if key == "window_airflow_m3_h" and not value:
+                    data[key] = None
+
+                elif typ is str:
+                    data[key] = value
+
                 else:
-                    data[key] = typ(
-                        value.replace(",", ".")
-                    )
+                    if not value:
+                        raise ValueError(
+                            "El campo '%s' no puede estar vacío." % key
+                        )
+
+                    try:
+                        data[key] = typ(value.replace(",", "."))
+                    except ValueError:
+                        raise ValueError(
+                            "El campo '%s' debe contener un número válido."
+                            % key
+                        )
 
             # Transmitancias U.
             for key, var in self.room_u_vars.items():
